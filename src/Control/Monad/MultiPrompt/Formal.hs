@@ -11,151 +11,160 @@ module Control.Monad.MultiPrompt.Formal where
 
 import Control.Monad (ap, liftM)
 import Data.FTCQueue (FTCQueue (..), ViewL (TOne, (:|)), tsingleton, tviewl, (><), (|>))
+import Data.Functor.Identity (Identity (Identity))
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 
-data Union (xs :: [k]) (h :: k -> Type) where
-    Here :: h x -> Union (x ': xs) h
-    There :: Union xs h -> Union (x ': xs) h
+{- | An type-safe open union (extensible sum) that does not support permutation of the list, and
+    behaves in a stack-like manner.
 
-mapUnion :: (forall x. h x -> i x) -> Union xs h -> Union xs i
-mapUnion f = \case
+    The implementation itself is possible with the usual open-union, but in that case the type-level
+    list of prompt stack frames becomes recursive and its size explodes exponentially, so this
+    approach prevents that.
+-}
+data StackUnion (xs :: [k]) (h :: k -> [k] -> Type) where
+    Here :: h x xs -> StackUnion (x ': xs) h
+    There :: StackUnion xs h -> StackUnion (x ': xs) h
+
+mapStackUnion :: (forall x r. h x r -> i x r) -> StackUnion xs h -> StackUnion xs i
+mapStackUnion f = \case
     Here x -> Here $ f x
-    There xs -> There $ mapUnion f xs
+    There xs -> There $ mapStackUnion f xs
 
-forUnion :: Union xs h -> (forall x. h x -> i x) -> Union xs i
-forUnion u f = mapUnion f u
+forStackUnion :: StackUnion xs h -> (forall x r. h x r -> i x r) -> StackUnion xs i
+forStackUnion u f = mapStackUnion f u
 
-class Member x xs where
-    inj :: h x -> Union xs h
-    prj :: Union xs h -> Maybe (h x)
+class Member x r xs where
+    inj :: h x r -> StackUnion xs h
+    prj :: StackUnion xs h -> Maybe (h x r)
 
-instance Member x (x ': xs) where
+inject :: (Member x r xs) => Proxy '(x, r) -> h x r -> StackUnion xs h
+inject _ = inj
+
+project :: (Member x r xs) => Proxy '(x, r) -> StackUnion xs h -> Maybe (h x r)
+project _ = prj
+
+instance Member x xs (x ': xs) where
     inj = Here
     prj = \case
         Here x -> Just x
         There _ -> Nothing
 
-instance {-# OVERLAPPABLE #-} (Member x xs) => Member x (x' ': xs) where
+instance {-# OVERLAPPABLE #-} (Member x r xs) => Member x r (x' ': xs) where
     inj = There . inj
     prj = \case
         Here _ -> Nothing
         There xs -> prj xs
 
-data Ctl fs a
+{- | A type-safe multi-prompt/control monad transformer.
+
+    @frames@: A list of the current prompt stack frames. Each element represents the answer type of delimited continuations at that frame.
+
+    @m@: The base monad.
+-}
+newtype CtlT frames m a = CtlT {unCtlT :: m (CtlResult frames m a)}
+
+data CtlResult frames m a
     = Pure a
-    | Ctl (Ctls fs a)
+    | Ctl (Ctls frames m a)
 
-type Ctls fs a = Union fs (CtlFrame fs a)
+type Ctls frames m a = StackUnion frames (CtlFrame frames m a)
 
-data Frame = Frame [Frame] Type
+data CtlFrame (w :: [Type]) (m :: Type -> Type) (a :: Type) (ans :: Type) (r :: [Type]) where
+    Abort :: ans -> CtlFrame w m a ans r
+    Control :: ((b -> CtlT r m ans) -> CtlT r m ans) -> FTCQueue (CtlT w m) b a -> CtlFrame w m a ans r
 
-data CtlFrame (fs :: [Frame]) (a :: Type) (f :: Frame) where
-    CtlFrame :: ((b -> Ctl fs' r) -> Ctl fs' r) -> FTCQueue (Ctl fs) b a -> CtlFrame fs a ('Frame fs' r)
-    AbortFrame :: r -> CtlFrame fs a ('Frame fs' r)
-
-hoistCtlFrame :: (forall x. Ctl fs x -> Ctl fs' x) -> CtlFrame fs a f -> CtlFrame fs' a f
-hoistCtlFrame phi = \case
-    CtlFrame ctl q -> CtlFrame ctl $ hoistFQ phi q
-    AbortFrame r -> AbortFrame r
-
-hoistFQ :: (forall x. m x -> n x) -> FTCQueue m a b -> FTCQueue n a b
-hoistFQ phi = \case
-    Leaf f -> Leaf $ phi . f
-    Node l r -> Node (hoistFQ phi l) (hoistFQ phi r)
-
-composeFrame :: (a -> Ctl fs b) -> CtlFrame fs a f -> CtlFrame fs b f
-composeFrame f = \case
-    CtlFrame ctl k -> CtlFrame ctl $ k |> f
-    AbortFrame r -> AbortFrame r
-
-composeFrames :: (a -> Ctl fs b) -> Ctls fs a -> Ctls fs b
-composeFrames f = mapUnion (composeFrame f)
-
-instance Functor (Ctl fs) where
+instance (Monad m) => Functor (CtlT fs m) where
     fmap = liftM
 
-instance Applicative (Ctl fs) where
-    pure = Pure
+instance (Monad m) => Applicative (CtlT fs m) where
+    pure = CtlT . pure . Pure
     (<*>) = ap
 
-instance Monad (Ctl fs) where
-    m >>= f = case m of
-        Pure x -> f x
-        Ctl ctls -> Ctl $ composeFrames f ctls
+instance (Monad m) => Monad (CtlT fs m) where
+    CtlT m >>= f =
+        CtlT $
+            m >>= \case
+                Pure x -> unCtlT $ f x
+                Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
+                    Abort a -> Abort a
+                    Control ctl q -> Control ctl $ q |> f
 
-runCtl :: Ctl '[] r -> r
-runCtl = \case
+prompt_ :: (Monad m) => CtlT (ans ': r) m ans -> CtlT r m ans
+prompt_ (CtlT m) =
+    CtlT $
+        m >>= \case
+            Pure x -> pure $ Pure x
+            Ctl ctls -> case ctls of
+                Here (Control ctl q) -> unCtlT $ ctl $ prompt_ . qApp q
+                Here (Abort ans) -> pure $ Pure ans
+                There ctls' -> pure $ Ctl $ forStackUnion ctls' \case
+                    (Control ctl q) -> Control ctl (tsingleton $ prompt_ . qApp q)
+                    Abort r -> Abort r
+
+prompt :: (Monad m) => (Proxy '(ans, r) -> CtlT (ans ': r) m ans) -> CtlT r m ans
+prompt f = prompt_ $ f Proxy
+
+control :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ((a -> CtlT r m ans) -> CtlT r m ans) -> CtlT fs m a
+control p f = CtlT . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . pure . Pure)
+
+delimitAbort ::
+    forall fs m a ans r.
+    (Member ans r fs, Monad m) =>
+    Proxy '(ans, r) ->
+    CtlT fs m a ->
+    (ans -> CtlT fs m a) ->
+    CtlT fs m a
+delimitAbort p (CtlT m) k =
+    CtlT $
+        m >>= \case
+            Pure x -> pure $ Pure x
+            Ctl ctls -> case project p ctls of
+                Just (Abort r) -> unCtlT $ k r
+                _ -> pure $ Ctl ctls
+
+abort :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ans -> CtlT fs m a
+abort p = CtlT . pure . Ctl . inject p . Abort
+
+embed :: (Member ans r fs, Monad m) => Proxy '(ans, r) -> CtlT r m a -> CtlT fs m a
+embed p m = control p (m >>=)
+
+qApp :: (Monad m) => FTCQueue (CtlT fs m) a b -> a -> CtlT fs m b
+qApp q x = CtlT $ case tviewl q of
+    TOne k -> unCtlT $ k x
+    k :| t ->
+        unCtlT (k x) >>= \case
+            Pure y -> unCtlT $ qApp t y
+            Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
+                Control ctl q' -> Control ctl $ q' >< t
+                Abort r -> Abort r
+
+runCtl :: (Monad m) => CtlT '[] m a -> m a
+runCtl (CtlT m) =
+    m >>= \case
+        Pure x -> pure x
+        Ctl ctls -> case ctls of {}
+
+runPure :: CtlT '[] Identity a -> a
+runPure (CtlT (Identity m)) = case m of
     Pure x -> x
     Ctl ctls -> case ctls of {}
 
-prompt_ :: Ctl ('Frame fs r ': fs) r -> Ctl fs r
-prompt_ = \case
-    Pure x -> pure x
-    Ctl ctls -> case ctls of
-        Here (CtlFrame ctl q) -> ctl $ prompt_ . qApp q
-        Here (AbortFrame r) -> pure r
-        There ctls' -> Ctl $ forUnion ctls' \case
-            (CtlFrame ctl q) -> CtlFrame ctl (tsingleton $ prompt_ . qApp q)
-            AbortFrame r -> AbortFrame r
+runExcept :: (Monad m) => (Proxy '(Either e a, r) -> CtlT (Either e a ': r) m a) -> CtlT r m (Either e a)
+runExcept m = prompt_ $ Right <$> m Proxy
 
-prompt :: (Proxy ('Frame fs r) -> Ctl ('Frame fs r ': fs) r) -> Ctl fs r
-prompt f = prompt_ $ f Proxy
-
-delimitAbort ::
-    forall fs a fs' r.
-    (Member ('Frame fs' r) fs) =>
-    Proxy ('Frame fs' r) ->
-    Ctl fs a ->
-    (r -> Ctl fs a) ->
-    Ctl fs a
-delimitAbort Proxy m k = case m of
-    Pure x -> pure x
-    Ctl ctls -> case prj @('Frame fs' r) ctls of
-        Just (AbortFrame r) -> k r
-        _ -> Ctl ctls
-
-control :: forall fs a fs' r. (Member ('Frame fs' r) fs) => Proxy ('Frame fs' r) -> ((a -> Ctl fs' r) -> Ctl fs' r) -> Ctl fs a
-control Proxy f = Ctl $ inj $ CtlFrame f (tsingleton pure)
-
-abort :: forall fs a fs' r. (Member ('Frame fs' r) fs) => Proxy ('Frame fs' r) -> r -> Ctl fs a
-abort Proxy r = Ctl $ inj @('Frame fs' r) $ AbortFrame r
-
-embed :: (Member ('Frame fs' r) fs) => Proxy ('Frame fs' r) -> Ctl fs' a -> Ctl fs a
-embed p m = control p (m >>=)
-
-qApp :: FTCQueue (Ctl fs) a b -> a -> Ctl fs b
-qApp q x = case tviewl q of
-    TOne k -> k x
-    k :| t -> case k x of
-        Pure y -> qApp t y
-        Ctl ctls -> Ctl $ forUnion ctls \case
-            CtlFrame ctl q' -> CtlFrame ctl $ q' >< t
-            AbortFrame r -> AbortFrame r
-
-mapCtl :: (Ctls fs a -> Ctls fs' a) -> Ctl fs a -> Ctl fs' a
-mapCtl f = \case
-    Pure x -> Pure x
-    Ctl ctls -> Ctl $ f ctls
-
-raise :: Ctl fs a -> Ctl (f ': fs) a
-raise = mapCtl $ There . mapUnion (hoistCtlFrame raise)
-
-try :: (Proxy ('Frame fs (Either e a)) -> Ctl ('Frame fs (Either e a) ': fs) a) -> Ctl fs (Either e a)
-try m = prompt_ $ Right <$> m Proxy
-
-throw :: (Member ('Frame fs' (Either e r)) fs) => Proxy ('Frame fs' (Either e r)) -> e -> Ctl fs a
+throw :: (Member (Either e ans) r fs, Monad m) => Proxy '(Either e ans, r) -> e -> CtlT fs m a
 throw p e = abort p $ Left e
 
-catch :: (Member ('Frame fs' (Either e r)) fs) => Proxy ('Frame fs' (Either e r)) -> Ctl fs a -> (e -> Ctl fs a) -> Ctl fs a
+catch :: (Member (Either e ans) r fs, Monad m) => Proxy '(Either e ans, r) -> CtlT fs m a -> (e -> CtlT fs m a) -> CtlT fs m a
 catch p m hdl =
     delimitAbort p m \case
         Left e -> hdl e
-        x -> abort p x
+        r -> abort p r
 
 test :: Either String Int
-test = runCtl do
-    try \p -> do
+test = runPure do
+    runExcept \p -> do
         catch p (throw p "BOOM") \s -> pure $ length s
 
 -- >>> test
