@@ -62,13 +62,21 @@ library
     import:           warnings
 
     -- Modules exported by the library.
-    exposed-modules:  MyLib
+    exposed-modules:
+        Data.FTCQueue
+        Control.Monad.MultiPrompt.Formal
 
     -- Modules included in this library but not exported.
     -- other-modules:
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
+
+    default-extensions:
+        LambdaCase
+        BlockArguments
+        DataKinds
+        GADTs
 
     -- Other library packages from which modules are imported.
     build-depends:    base ^>=4.19.2.0
