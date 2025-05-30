@@ -65,6 +65,7 @@ library
     exposed-modules:
         Data.FTCQueue
         Control.Monad.MultiPrompt.Formal
+        Control.Effect.Env.Formal
 
     -- Modules included in this library but not exported.
     -- other-modules:
@@ -79,7 +80,10 @@ library
         GADTs
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.19.2.0
+    build-depends:
+        base ^>=4.19.2.0,
+        data-effects,
+        unliftio,
 
     -- Directories containing source files.
     hs-source-dirs:   src
