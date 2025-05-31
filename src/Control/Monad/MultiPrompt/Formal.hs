@@ -1,5 +1,8 @@
+{-# LANGUAGE FunctionalDependencies #-}
 -- SPDX-License-Identifier: MPL-2.0
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 {- |
 Copyright   :  (c) 2025 Sayo contributors
@@ -37,7 +40,7 @@ mapStackUnion f = \case
 forStackUnion :: StackUnion xs h -> (forall x r. h x r -> i x r) -> StackUnion xs i
 forStackUnion u f = mapStackUnion f u
 
-class Member x r xs where
+class Member x r xs | r xs -> x where
     inj :: h x r -> StackUnion xs h
     prj :: StackUnion xs h -> Maybe (h x r)
 
@@ -165,6 +168,19 @@ delimitAbort p (CtlT m) k =
 
 abort :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ans -> CtlT fs m a
 abort p = CtlT . pure . Ctl . inject p . Abort
+
+class (eq ~ Equal fs r) => Embed eq fs r m where
+    embed' :: CtlT r m a -> CtlT fs m a
+
+type family Equal a b where
+    Equal a a = 'True
+    Equal _ _ = 'False
+
+instance Embed 'True r r m where
+    embed' = id
+
+instance (Embed eq fs r m, Monad m, Equal (ans : fs) r ~ 'False) => Embed 'False (ans : fs) r m where
+    embed' = embed Proxy . embed' @eq @fs @r
 
 embed :: (Member ans r fs, Monad m) => Proxy '(ans, r) -> CtlT r m a -> CtlT fs m a
 embed p m = control p (m >>=)
