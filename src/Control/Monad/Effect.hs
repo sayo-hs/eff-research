@@ -1,5 +1,5 @@
-{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# HLINT ignore "Avoid lambda" #-}
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
@@ -19,14 +19,21 @@ import Data.Kind (Type)
 import UnliftIO (MonadIO, MonadUnliftIO, liftIO, withRunInIO)
 
 type Effect = (Type -> Type) -> Type -> Type
-data Frame = E Effect [Type]
+data EffectFrame = E Effect [Type]
+data Frames = Frames [EffectFrame] [Type]
+
+type family EffectFrameOf es where
+    EffectFrameOf ('Frames es _) = es
+
+type family PromptFrameOf es where
+    PromptFrameOf ('Frames _ ps) = ps
 
 -- | A effect handler.
 data Handler e m where
     Handler :: (forall x. e (CtlT ps m) x -> CtlT ps m x) -> Handler ('E e ps) m
 
 -- | Vector of handlers.
-data Handlers (es :: [Frame]) m where
+data Handlers (es :: [EffectFrame]) m where
     Cons :: Handler e m -> Handlers es m -> Handlers (e : es) m
     Nil :: Handlers '[] m
 
@@ -36,7 +43,7 @@ data Membership ff es ps = Membership
     }
 
 -- | Type-level search over elements in a vector.
-class Elem ff (es :: [Frame]) ps | ff es -> ps where
+class Elem ff (es :: [EffectFrame]) ps | ff es -> ps where
     membership :: Membership ff es ps
 
 instance Elem ff ('E ff ps : es) ps where
@@ -58,42 +65,42 @@ instance {-# OVERLAPPABLE #-} (Elem ff es ps) => Elem ff ('E ff' ps' : es) ps wh
 (!:) = Cons
 
 -- | An effect monad transformer built on top of a multi-prompt/control monad.
-newtype EffT es ps m a
-    = EffT {unEffT :: Handlers es m -> CtlT ps m a}
+newtype EffT es m a
+    = EffT {unEffT :: Handlers (EffectFrameOf es) m -> CtlT (PromptFrameOf es) m a}
     deriving (Functor)
 
-interpretAll :: Handlers es m -> EffT es ps m a -> CtlT ps m a
+interpretAll :: Handlers es m -> EffT ('Frames es ps) m a -> CtlT ps m a
 interpretAll = flip unEffT
 
-runEffT :: (Functor f) => EffT '[] '[] f a -> f a
+runEffT :: (Functor f) => EffT ('Frames '[] '[]) f a -> f a
 runEffT = C.runCtlT . interpretAll Nil
 
-runPure :: EffT '[] '[] Identity a -> a
+runPure :: EffT ('Frames '[] '[]) Identity a -> a
 runPure = C.runPure . interpretAll Nil
 
-liftEffT :: CtlT ps m a -> EffT es ps m a
+liftEffT :: CtlT ps m a -> EffT ('Frames es ps) m a
 liftEffT m = EffT $ const m
 
-instance (Monad m) => Applicative (EffT es ps m) where
+instance (Monad m) => Applicative (EffT es m) where
     pure x = EffT \_ -> pure x
     EffT ff <*> EffT fa = EffT \v -> ff v <*> fa v
 
-instance (Monad m) => Monad (EffT es ps m) where
+instance (Monad m) => Monad (EffT ('Frames es ps) m) where
     EffT m >>= f = EffT \v -> m v >>= interpretAll v . f
 
-instance (MonadIO m) => MonadIO (EffT es ps m) where
+instance (MonadIO m) => MonadIO (EffT ('Frames es ps) m) where
     liftIO m = EffT \_ -> liftIO m
 
-instance (MonadUnliftIO m) => MonadUnliftIO (EffT es '[] m) where
+instance (MonadUnliftIO m) => MonadUnliftIO (EffT ('Frames es '[]) m) where
     withRunInIO f = EffT \v -> withRunInIO \run -> f $ run . interpretAll v
 
-instance (Unlift b f, Functor f) => Unlift b (EffT es '[] f) where
+instance (Unlift b f, Functor f) => Unlift b (EffT ('Frames es '[]) f) where
     withRunInBase f = EffT \v -> withRunInBase \run -> f $ run . interpretAll v
 
-withEffToCtl :: ((forall x. EffT es ps m x -> CtlT ps m x) -> CtlT ps m a) -> EffT es ps m a
+withEffToCtl :: ((forall x. EffT ('Frames es ps) m x -> CtlT ps m x) -> CtlT ps m a) -> EffT ('Frames es ps) m a
 withEffToCtl f = EffT \v -> f (interpretAll v)
 
-trans :: (Handlers es' m -> Handlers es m) -> EffT es ps m a -> EffT es' ps m a
+trans :: (Handlers es' m -> Handlers es m) -> EffT ('Frames es ps) m a -> EffT ('Frames es' ps) m a
 trans f (EffT withHandlerVec) = EffT $ withHandlerVec . f
 
 -- | A type-class for higher-order effects.
@@ -104,28 +111,28 @@ send ::
     forall e es ps psUnder m a.
     (psUnder < ps, HFunctor e, Monad m) =>
     Membership e es psUnder ->
-    e (EffT es psUnder m) a ->
-    EffT es ps m a
+    e (EffT ('Frames es psUnder) m) a ->
+    EffT ('Frames es ps) m a
 send ix e =
     EffT \v ->
         case getHandler ix v of
             Handler h -> embed $ h $ hfmap (interpretAll v) e
 
-prompt :: (Monad m) => EffT es (ans : ps) m ans -> EffT es ps m ans
+prompt :: (Monad m) => EffT ('Frames es (ans : ps)) m ans -> EffT ('Frames es ps) m ans
 prompt (EffT m) = EffT \v -> C.prompt_ $ m v
 
 interpret ::
     (HFunctor e, Monad m) =>
-    (forall x. Proxy ps -> e (EffT es (ans : ps) m) x -> EffT es (ans : ps) m x) ->
-    EffT ('E e (ans : ps) : es) (ans : ps) m ans ->
-    EffT es ps m ans
+    (forall x. Proxy ps -> e (EffT ('Frames es (ans : ps)) m) x -> EffT ('Frames es (ans : ps)) m x) ->
+    EffT ('Frames ('E e (ans : ps) : es) (ans : ps)) m ans ->
+    EffT ('Frames es ps) m ans
 interpret f m = EffT \v -> interpretAll v $ prompt $ trans (Handler (interpretAll v . f Proxy . hfmap liftEffT) !:) m
 
 interpretTail ::
     (HFunctor e) =>
-    (forall x. e (EffT es ps m) x -> EffT es ps m x) ->
-    EffT ('E e ps : es) ps m a ->
-    EffT es ps m a
+    (forall x. e (EffT ('Frames es ps) m) x -> EffT ('Frames es ps) m x) ->
+    EffT ('Frames ('E e ps : es) ps) m a ->
+    EffT ('Frames es ps) m a
 interpretTail f m = EffT \v -> interpretAll v $ trans (Handler (interpretAll v . f . hfmap liftEffT) !:) m
 
 data Throw e :: Effect where
@@ -144,8 +151,8 @@ instance HFunctor (Catch e) where
 runThrow ::
     forall m e a ps es.
     (Monad m) =>
-    EffT ('E (Throw e) (Either e a : ps) : es) (Either e a : ps) m a ->
-    EffT es ps m (Either e a)
+    EffT ('Frames ('E (Throw e) (Either e a : ps) : es) (Either e a : ps)) m a ->
+    EffT ('Frames es ps) m (Either e a)
 runThrow m =
     Right <$> m & interpret \p -> \case
         Throw e -> liftEffT $ abort p $ Left e
@@ -153,8 +160,8 @@ runThrow m =
 runCatch ::
     forall e m a ps es ans r.
     (Member (Either e ans) r ps, Elem (Throw e) es (Either e ans ': r), Monad m) =>
-    EffT ('E (Catch e) ps : es) ps m a ->
-    EffT es ps m a
+    EffT ('Frames ('E (Catch e) ps : es) ps) m a ->
+    EffT ('Frames es ps) m a
 runCatch = interpretTail \case
     Catch m' hdl ->
         withEffToCtl \run ->
@@ -166,10 +173,10 @@ runCatch = interpretTail \case
 perform :: (Elem e es psUnder) => (Membership e es psUnder -> r) -> r
 perform f = f membership
 
-throw :: forall e es r ps m a. (r < ps, Monad m) => Membership (Throw e) es r -> e -> EffT es ps m a
+throw :: forall e es r ps m a. (r < ps, Monad m) => Membership (Throw e) es r -> e -> EffT ('Frames es ps) m a
 throw i = send i . Throw
 
-catch :: forall e es r ps m a. (r < ps, Monad m) => Membership (Catch e) es r -> EffT es r m a -> (e -> EffT es r m a) -> EffT es ps m a
+catch :: forall e es r ps m a. (r < ps, Monad m) => Membership (Catch e) es r -> EffT ('Frames es r) m a -> (e -> EffT ('Frames es r) m a) -> EffT ('Frames es ps) m a
 catch i m h = send i $ Catch m h
 
 test :: Either String (Either Int Int)
