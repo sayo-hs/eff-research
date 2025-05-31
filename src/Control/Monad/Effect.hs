@@ -1,10 +1,8 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# HLINT ignore "Avoid lambda" #-}
+{-# OPTIONS_GHC -Wno-redundant-constraints #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 -- SPDX-License-Identifier: MPL-2.0
@@ -24,56 +22,56 @@ type Effect = (Type -> Type) -> Type -> Type
 data Frame = E Effect [Type]
 
 -- | A effect handler.
-data Handler e b where
-    Handler :: (forall x. e (CtlT fs b) x -> CtlT fs b x) -> Handler ('E e fs) b
+data Handler e m where
+    Handler :: (forall x. e (CtlT ps m) x -> CtlT ps m x) -> Handler ('E e ps) m
 
 -- | Vector of handlers.
-data Handlers (es :: [Frame]) b where
-    Cons :: Handler e b -> Handlers es b -> Handlers (e : es) b
-    Nil :: Handlers '[] b
+data Handlers (es :: [Frame]) m where
+    Cons :: Handler e m -> Handlers es m -> Handlers (e : es) m
+    Nil :: Handlers '[] m
 
 -- | Type-level search over elements in a vector.
-class Elem ff (es :: [Frame]) fs | ff es -> fs where
-    getHandler :: Handlers es b -> Handler ('E ff fs) b
-    updateHandler :: Handler ('E ff fs) b -> Handlers es b -> Handlers es b
+class Elem ff (es :: [Frame]) ps | ff es -> ps where
+    getHandler :: Handlers es m -> Handler ('E ff ps) m
+    updateHandler :: Handler ('E ff ps) m -> Handlers es m -> Handlers es m
 
-instance Elem ff ('E ff fs : es) fs where
+instance Elem ff ('E ff ps : es) ps where
     getHandler (Cons h _) = h
     updateHandler h (Cons _ hs) = Cons h hs
 
-instance {-# OVERLAPPABLE #-} (Elem ff es fs) => Elem ff ('E ff' fs' : es) fs where
+instance {-# OVERLAPPABLE #-} (Elem ff es ps) => Elem ff ('E ff' ps' : es) ps where
     getHandler (Cons _ hs) = getHandler hs
     updateHandler h (Cons h' hs) = Cons h' $ updateHandler h hs
 
 -- | Prepend to the handler vector.
-(!:) :: Handler e b -> Handlers es b -> Handlers (e : es) b
+(!:) :: Handler e m -> Handlers es m -> Handlers (e : es) m
 (!:) = Cons
 
 -- | An effect monad transformer built on top of a multi-prompt/control monad.
-newtype EffT es fs b a
-    = EffT {unEffT :: Handlers es b -> CtlT fs b a}
+newtype EffT es ps m a
+    = EffT {unEffT :: Handlers es m -> CtlT ps m a}
     deriving (Functor)
 
-interpretAll :: Handlers es b -> EffT es fs b a -> CtlT fs b a
+interpretAll :: Handlers es m -> EffT es ps m a -> CtlT ps m a
 interpretAll = flip unEffT
 
-runEffT :: (Functor b) => EffT '[] '[] b a -> b a
+runEffT :: (Functor f) => EffT '[] '[] f a -> f a
 runEffT = C.runCtlT . interpretAll Nil
 
 runPure :: EffT '[] '[] Identity a -> a
 runPure = C.runPure . interpretAll Nil
 
-liftEffT :: CtlT fs b a -> EffT es fs b a
+liftEffT :: CtlT fs m a -> EffT es fs m a
 liftEffT m = EffT $ const m
 
-instance (Monad m) => Applicative (EffT es fs m) where
+instance (Monad m) => Applicative (EffT es ps m) where
     pure x = EffT \_ -> pure x
     EffT ff <*> EffT fa = EffT \v -> ff v <*> fa v
 
-instance (Monad m) => Monad (EffT es fs m) where
+instance (Monad m) => Monad (EffT es ps m) where
     EffT m >>= f = EffT \v -> m v >>= interpretAll v . f
 
-instance (MonadIO m) => MonadIO (EffT es fs m) where
+instance (MonadIO m) => MonadIO (EffT es ps m) where
     liftIO m = EffT \_ -> liftIO m
 
 instance (MonadUnliftIO m) => MonadUnliftIO (EffT es '[] m) where
@@ -82,34 +80,34 @@ instance (MonadUnliftIO m) => MonadUnliftIO (EffT es '[] m) where
 instance (Unlift b f, Functor f) => Unlift b (EffT es '[] f) where
     withRunInBase f = EffT \v -> withRunInBase \run -> f $ run . interpretAll v
 
-withEffToCtl :: ((forall x. EffT es fs b x -> CtlT fs b x) -> CtlT fs b a) -> EffT es fs b a
+withEffToCtl :: ((forall x. EffT es ps m x -> CtlT ps m x) -> CtlT ps m a) -> EffT es ps m a
 withEffToCtl f = EffT \v -> f (interpretAll v)
 
-trans :: (Handlers es' b -> Handlers es b) -> EffT es fs b a -> EffT es' fs b a
+trans :: (Handlers es' m -> Handlers es m) -> EffT es ps m a -> EffT es' ps m a
 trans f (EffT withHandlerVec) = EffT $ withHandlerVec . f
 
 -- | A type-class for higher-order effects.
 class HFunctor ff where
     hfmap :: (forall x. f x -> g x) -> ff f a -> ff g a
 
-send :: forall ff es fs fsSend b a. (Elem ff es fsSend, fsSend < fs, HFunctor ff, Monad b) => ff (EffT es fsSend b) a -> EffT es fs b a
-send e = EffT \v -> case getHandler @ff v of Handler h -> embed $ h $ hfmap (interpretAll v) e
+send :: forall e es ps psSend m a. (Elem e es psSend, psSend < ps, HFunctor e, Monad m) => e (EffT es psSend m) a -> EffT es ps m a
+send e = EffT \v -> case getHandler v of Handler h -> embed $ h $ hfmap (interpretAll v) e
 
-prompt :: (Monad b) => EffT es (ans : fs) b ans -> EffT es fs b ans
+prompt :: (Monad m) => EffT es (ans : ps) m ans -> EffT es ps m ans
 prompt (EffT m) = EffT \v -> C.prompt_ $ m v
 
 interpret ::
-    (HFunctor e, Monad b) =>
-    (forall x. Proxy '(ans, fs) -> e (EffT es (ans : fs) b) x -> EffT es (ans : fs) b x) ->
-    EffT ('E e (ans : fs) : es) (ans : fs) b ans ->
-    EffT es fs b ans
+    (HFunctor e, Monad m) =>
+    (forall x. Proxy ps -> e (EffT es (ans : ps) m) x -> EffT es (ans : ps) m x) ->
+    EffT ('E e (ans : ps) : es) (ans : ps) m ans ->
+    EffT es ps m ans
 interpret f m = EffT \v -> interpretAll v $ prompt $ trans (Handler (interpretAll v . f Proxy . hfmap liftEffT) !:) m
 
 interpretTail ::
-    (HFunctor e, Monad b) =>
-    (forall x. e (EffT es ps b) x -> EffT es ps b x) ->
-    EffT ('E e ps : es) ps b a ->
-    EffT es ps b a
+    (HFunctor e) =>
+    (forall x. e (EffT es ps m) x -> EffT es ps m x) ->
+    EffT ('E e ps : es) ps m a ->
+    EffT es ps m a
 interpretTail f m = EffT \v -> interpretAll v $ trans (Handler (interpretAll v . f . hfmap liftEffT) !:) m
 
 data Throw e :: Effect where
@@ -126,31 +124,31 @@ instance HFunctor (Catch e) where
         Catch m hdl -> Catch (f m) (f . hdl)
 
 runThrow ::
-    forall b e a ps es.
-    (Monad b) =>
-    EffT ('E (Throw e) (Either e a : ps) : es) (Either e a : ps) b a ->
-    EffT es ps b (Either e a)
+    forall m e a ps es.
+    (Monad m) =>
+    EffT ('E (Throw e) (Either e a : ps) : es) (Either e a : ps) m a ->
+    EffT es ps m (Either e a)
 runThrow m =
     Right <$> m & interpret \p -> \case
         Throw e -> liftEffT $ abort p $ Left e
 
 runCatch ::
-    forall e b a ps es ans r.
-    (Monad b, Member (Either e ans) r ps, Elem (Throw e) es (Either e ans ': r)) =>
-    EffT ('E (Catch e) ps : es) ps b a ->
-    EffT es ps b a
+    forall e m a ps es ans r.
+    (Member (Either e ans) r ps, Elem (Throw e) es (Either e ans ': r), Monad m) =>
+    EffT ('E (Catch e) ps : es) ps m a ->
+    EffT es ps m a
 runCatch = interpretTail \case
     Catch m' hdl ->
         withEffToCtl \run ->
-            let p = Proxy @'(Either e ans, r)
+            let p = Proxy @r
              in delimitAbort p (run m') \case
                     Left e -> run $ hdl e
                     x -> abort p x
 
-throw :: (Elem (Throw e) es r, r < fs, Monad b) => e -> EffT es fs b a
+throw :: (Elem (Throw e) es r, r < ps, Monad b) => e -> EffT es ps b a
 throw = send . Throw
 
-catch :: (Elem (Catch e) es r, r < fs, Monad b) => EffT es r b a -> (e -> EffT es r b a) -> EffT es fs b a
+catch :: (Elem (Catch e) es r, r < ps, Monad m) => EffT es r m a -> (e -> EffT es r m a) -> EffT es ps m a
 catch m h = send $ Catch m h
 
 test :: Either String (Either Int Int)

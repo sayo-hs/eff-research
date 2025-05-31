@@ -1,8 +1,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
--- SPDX-License-Identifier: MPL-2.0
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
+
+-- SPDX-License-Identifier: MPL-2.0
 
 {- |
 Copyright   :  (c) 2025 Sayo contributors
@@ -44,40 +43,11 @@ class Member x r xs | r xs -> x where
     inj :: h x r -> StackUnion xs h
     prj :: StackUnion xs h -> Maybe (h x r)
 
-inject :: (Member x r xs) => Proxy '(x, r) -> h x r -> StackUnion xs h
+inject :: (Member x r xs) => Proxy r -> h x r -> StackUnion xs h
 inject _ = inj
 
-project :: (Member x r xs) => Proxy '(x, r) -> StackUnion xs h -> Maybe (h x r)
+project :: (Member x r xs) => Proxy r -> StackUnion xs h -> Maybe (h x r)
 project _ = prj
-
-infix 4 <
-
-class xs < ys where
-    weaken :: StackUnion xs h -> StackUnion ys h
-
-instance xs < xs where
-    weaken = id
-
-instance {-# INCOHERENT #-} (xs < ys) => xs < y : ys where
-    weaken = There . weaken
-
-data Membership x r xs = Membership
-    { inj' :: forall h. h x r -> StackUnion xs h
-    , prj' :: forall h. StackUnion xs h -> Maybe (h x r)
-    }
-
-here :: Membership x xs (x ': xs)
-here = Membership Here \case
-    Here x -> Just x
-    There _ -> Nothing
-
-there :: Membership x r xs -> Membership x r (x ': xs)
-there Membership{..} = Membership (There . inj') \case
-    Here _ -> Nothing
-    There xs -> prj' xs
-
-mkMembership :: (Member x r xs) => Membership x r xs
-mkMembership = Membership inj prj
 
 instance Member x xs (x : xs) where
     inj = Here
@@ -91,19 +61,30 @@ instance {-# OVERLAPPABLE #-} (Member x r xs) => Member x r (x' : xs) where
         Here _ -> Nothing
         There xs -> prj xs
 
+infix 4 <
+
+class xs < ys where
+    weaken :: StackUnion xs h -> StackUnion ys h
+
+instance xs < xs where
+    weaken = id
+
+instance {-# INCOHERENT #-} (xs < ys) => xs < y : ys where
+    weaken = There . weaken
+
 {- | A type-safe multi-prompt/control monad transformer.
 
     @frames@: A list of the current prompt stack frames. Each element represents the answer type of delimited continuations at that frame.
 
     @m@: The base monad.
 -}
-newtype CtlT frames m a = CtlT {unCtlT :: m (CtlResult frames m a)}
+newtype CtlT promptFrames m a = CtlT {unCtlT :: m (CtlResult promptFrames m a)}
 
-data CtlResult frames m a
+data CtlResult ps m a
     = Pure a
-    | Ctl (Ctls frames m a)
+    | Ctl (Ctls ps m a)
 
-type Ctls frames m a = StackUnion frames (CtlFrame frames m a)
+type Ctls ps m a = StackUnion ps (CtlFrame ps m a)
 
 data CtlFrame (w :: [Type]) (m :: Type -> Type) (a :: Type) (ans :: Type) (r :: [Type]) where
     Abort :: ans -> CtlFrame w m a ans r
@@ -144,7 +125,7 @@ class Unlift b m where
 instance (Unlift b f, Functor f) => Unlift b (CtlT '[] f) where
     withRunInBase f = CtlT $ Pure <$> withRunInBase \run -> f (run . runCtlT)
 
-prompt_ :: (Monad m) => CtlT (ans : r) m ans -> CtlT r m ans
+prompt_ :: (Monad m) => CtlT (ans : ps) m ans -> CtlT ps m ans
 prompt_ (CtlT m) =
     CtlT $
         m >>= \case
@@ -156,19 +137,19 @@ prompt_ (CtlT m) =
                     (Control ctl q) -> Control ctl (tsingleton $ prompt_ . qApp q)
                     Abort r -> Abort r
 
-prompt :: (Monad m) => (Proxy '(ans, r) -> CtlT (ans : r) m ans) -> CtlT r m ans
+prompt :: (Monad m) => (Proxy ps -> CtlT (ans : ps) m ans) -> CtlT ps m ans
 prompt f = prompt_ $ f Proxy
 
-control :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ((a -> CtlT r m ans) -> CtlT r m ans) -> CtlT fs m a
+control :: (Member ans psUnder ps, Applicative m) => Proxy psUnder -> ((a -> CtlT psUnder m ans) -> CtlT psUnder m ans) -> CtlT ps m a
 control p f = CtlT . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . pure . Pure)
 
 delimitAbort ::
-    forall fs m a ans r.
-    (Member ans r fs, Monad m) =>
-    Proxy '(ans, r) ->
-    CtlT fs m a ->
-    (ans -> CtlT fs m a) ->
-    CtlT fs m a
+    forall ps m a psUnder ans.
+    (Member ans psUnder ps, Monad m) =>
+    Proxy psUnder ->
+    CtlT ps m a ->
+    (ans -> CtlT ps m a) ->
+    CtlT ps m a
 delimitAbort p (CtlT m) k =
     CtlT $
         m >>= \case
@@ -177,10 +158,10 @@ delimitAbort p (CtlT m) k =
                 Just (Abort r) -> unCtlT $ k r
                 _ -> pure $ Ctl ctls
 
-abort :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ans -> CtlT fs m a
+abort :: (Member ans psUnder ps, Applicative f) => Proxy psUnder -> ans -> CtlT ps f a
 abort p = CtlT . pure . Ctl . inject p . Abort
 
-embed :: (r < fs, Monad m) => CtlT r m a -> CtlT fs m a
+embed :: (psUnder < ps, Monad m) => CtlT psUnder m a -> CtlT ps m a
 embed (CtlT m) =
     CtlT $
         m <&> \case
@@ -189,7 +170,7 @@ embed (CtlT m) =
                 Abort ans -> Abort ans
                 Control ctl q -> Control ctl $ tsingleton $ embed . qApp q
 
-qApp :: (Monad m) => FTCQueue (CtlT fs m) a b -> a -> CtlT fs m b
+qApp :: (Monad m) => FTCQueue (CtlT ps m) a b -> a -> CtlT ps m b
 qApp q x = CtlT $ case tviewl q of
     TOne k -> unCtlT $ k x
     k :| t ->
@@ -212,27 +193,3 @@ runPure :: CtlT '[] Identity a -> a
 runPure (CtlT (Identity m)) = case m of
     Pure x -> x
     Ctl ctls -> case ctls of {}
-
-runExcept :: (Monad m) => (Proxy '(Either e a, r) -> CtlT (Either e a : r) m a) -> CtlT r m (Either e a)
-runExcept m = prompt_ $ Right <$> m Proxy
-
-throw :: (Member (Either e ans) r fs, Monad m) => Proxy '(Either e ans, r) -> e -> CtlT fs m a
-throw p e = abort p $ Left e
-
-catch :: (Member (Either e ans) r fs, Monad m) => Proxy '(Either e ans, r) -> CtlT fs m a -> (e -> CtlT fs m a) -> CtlT fs m a
-catch p m hdl =
-    delimitAbort p m \case
-        Left e -> hdl e
-        r -> abort p r
-
-test :: Either String (Either Int Int)
-test = runPure do
-    runExcept \pString -> do
-        runExcept \_ -> do
-            catch
-                pString
-                (embed @'[Either String (Either Int Int)] $ throw pString "abc")
-                (\(s :: String) -> pure (length s))
-
--- >>> test
--- Right (Right 3)
