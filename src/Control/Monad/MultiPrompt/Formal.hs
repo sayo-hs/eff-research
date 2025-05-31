@@ -50,6 +50,17 @@ inject _ = inj
 project :: (Member x r xs) => Proxy '(x, r) -> StackUnion xs h -> Maybe (h x r)
 project _ = prj
 
+infix 4 <
+
+class xs < ys where
+    weaken :: StackUnion xs h -> StackUnion ys h
+
+instance xs < xs where
+    weaken = id
+
+instance {-# INCOHERENT #-} (xs < ys) => xs < y : ys where
+    weaken = There . weaken
+
 data Membership x r xs = Membership
     { inj' :: forall h. h x r -> StackUnion xs h
     , prj' :: forall h. StackUnion xs h -> Maybe (h x r)
@@ -169,21 +180,14 @@ delimitAbort p (CtlT m) k =
 abort :: (Member ans r fs, Applicative m) => Proxy '(ans, r) -> ans -> CtlT fs m a
 abort p = CtlT . pure . Ctl . inject p . Abort
 
-class (eq ~ Equal fs r) => Embed eq fs r m where
-    embed' :: CtlT r m a -> CtlT fs m a
-
-type family Equal a b where
-    Equal a a = 'True
-    Equal _ _ = 'False
-
-instance Embed 'True r r m where
-    embed' = id
-
-instance (Embed eq fs r m, Monad m, Equal (ans : fs) r ~ 'False) => Embed 'False (ans : fs) r m where
-    embed' = embed Proxy . embed' @eq @fs @r
-
-embed :: (Member ans r fs, Monad m) => Proxy '(ans, r) -> CtlT r m a -> CtlT fs m a
-embed p m = control p (m >>=)
+embed :: (r < fs, Monad m) => CtlT r m a -> CtlT fs m a
+embed (CtlT m) =
+    CtlT $
+        m <&> \case
+            Pure x -> Pure x
+            Ctl ctls -> Ctl $ forStackUnion (weaken ctls) \case
+                Abort ans -> Abort ans
+                Control ctl q -> Control ctl $ tsingleton $ embed . qApp q
 
 qApp :: (Monad m) => FTCQueue (CtlT fs m) a b -> a -> CtlT fs m b
 qApp q x = CtlT $ case tviewl q of
@@ -221,10 +225,14 @@ catch p m hdl =
         Left e -> hdl e
         r -> abort p r
 
-test :: Either String Int
+test :: Either String (Either Int Int)
 test = runPure do
-    runExcept \p -> do
-        catch p (throw p "BOOM") \s -> pure $ length s
+    runExcept \pString -> do
+        runExcept \_ -> do
+            catch
+                pString
+                (embed @'[Either String (Either Int Int)] $ throw pString "abc")
+                (\(s :: String) -> pure (length s))
 
 -- >>> test
--- Right 4
+-- Right (Right 3)

@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -10,8 +11,9 @@
 
 module Control.Monad.Effect where
 
-import Control.Monad.MultiPrompt.Formal (CtlT, Embed, Unlift (withRunInBase), abort, delimitAbort, embed')
+import Control.Monad.MultiPrompt.Formal (CtlT, Member, Unlift (withRunInBase), abort, delimitAbort, embed, type (<))
 import Control.Monad.MultiPrompt.Formal qualified as C
+import Data.Coerce (coerce)
 import Data.Data (Proxy (Proxy))
 import Data.Function ((&))
 import Data.Functor.Identity (Identity)
@@ -90,8 +92,8 @@ trans f (EffT withHandlerVec) = EffT $ withHandlerVec . f
 class HFunctor ff where
     hfmap :: (forall x. f x -> g x) -> ff f a -> ff g a
 
-send :: forall ff es fs fsSend b a eq. (Elem ff es fsSend, Embed eq fs fsSend b, HFunctor ff) => ff (EffT es fsSend b) a -> EffT es fs b a
-send e = EffT \v -> case getHandler @ff v of Handler h -> embed' $ h $ hfmap (interpretAll v) e
+send :: forall ff es fs fsSend b a. (Elem ff es fsSend, fsSend < fs, HFunctor ff, Monad b) => ff (EffT es fsSend b) a -> EffT es fs b a
+send e = EffT \v -> case getHandler @ff v of Handler h -> embed $ h $ hfmap (interpretAll v) e
 
 prompt :: (Monad b) => EffT es (ans : fs) b ans -> EffT es fs b ans
 prompt (EffT m) = EffT \v -> C.prompt_ $ m v
@@ -103,38 +105,60 @@ interpret ::
     EffT es fs b ans
 interpret f m = EffT \v -> interpretAll v $ prompt $ trans (Handler (interpretAll v . f Proxy . hfmap liftEffT) !:) m
 
-data Except e :: Effect where
-    Throw :: e -> Except e f a
-    Catch :: f a -> (e -> f a) -> Except e f a
+interpretTail ::
+    (HFunctor e, Monad b) =>
+    (forall x. e (EffT es ps b) x -> EffT es ps b x) ->
+    EffT ('E e ps : es) ps b a ->
+    EffT es ps b a
+interpretTail f m = EffT \v -> interpretAll v $ trans (Handler (interpretAll v . f . hfmap liftEffT) !:) m
 
-instance HFunctor (Except e) where
+data Throw e :: Effect where
+    Throw :: e -> Throw e f a
+
+data Catch e :: Effect where
+    Catch :: f a -> (e -> f a) -> Catch e f a
+
+instance HFunctor (Throw e) where
+    hfmap _ = coerce
+
+instance HFunctor (Catch e) where
     hfmap f = \case
-        Throw e -> Throw e
         Catch m hdl -> Catch (f m) (f . hdl)
 
-runExcept ::
+runThrow ::
     forall b e a ps es.
     (Monad b) =>
-    EffT ('E (Except e) (Either e a : ps) : es) (Either e a : ps) b a ->
+    EffT ('E (Throw e) (Either e a : ps) : es) (Either e a : ps) b a ->
     EffT es ps b (Either e a)
-runExcept m =
+runThrow m =
     Right <$> m & interpret \p -> \case
         Throw e -> liftEffT $ abort p $ Left e
-        Catch m' hdl ->
-            withEffToCtl \run ->
-                delimitAbort p (run m') \case
+
+runCatch ::
+    forall e b a ps es ans r.
+    (Monad b, Member (Either e ans) r ps, Elem (Throw e) es (Either e ans ': r)) =>
+    EffT ('E (Catch e) ps : es) ps b a ->
+    EffT es ps b a
+runCatch = interpretTail \case
+    Catch m' hdl ->
+        withEffToCtl \run ->
+            let p = Proxy @'(Either e ans, r)
+             in delimitAbort p (run m') \case
                     Left e -> run $ hdl e
                     x -> abort p x
 
-throw :: (Elem (Except e) es r, Embed eq fs r b) => e -> EffT es fs b a
+throw :: (Elem (Throw e) es r, r < fs, Monad b) => e -> EffT es fs b a
 throw = send . Throw
 
-catch :: (Elem (Except e) es r, Embed eq fs r b) => EffT es r b a -> (e -> EffT es r b a) -> EffT es fs b a
+catch :: (Elem (Catch e) es r, r < fs, Monad b) => EffT es r b a -> (e -> EffT es r b a) -> EffT es fs b a
 catch m h = send $ Catch m h
 
-test :: Either String (Either Char Int)
-test = runPure . runExcept . runExcept $ do
+test :: Either String (Either Int Int)
+test = runPure . runThrow . runThrow . runCatch @String . runCatch @Int $ do
     catch
         do
-            catch (throw 'c') \(s :: Char) -> pure 0
-        \(c :: String) -> undefined
+            catch (throw @Int 123456) \(i :: Int) -> throw $ show i
+        \(s :: String) -> pure (length s)
+
+-- >>> test
+-- Right (Right 6)
