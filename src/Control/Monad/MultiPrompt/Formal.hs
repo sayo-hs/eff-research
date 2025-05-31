@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: MPL-2.0
+{-# LANGUAGE RecordWildCards #-}
 
 {- |
 Copyright   :  (c) 2025 Sayo contributors
@@ -9,7 +10,7 @@ A fully type-safe multi-prompt/control monad, inspired by [speff](https://github
 -}
 module Control.Monad.MultiPrompt.Formal where
 
-import Control.Monad (ap, liftM)
+import Control.Monad (ap)
 import Data.FTCQueue (FTCQueue (..), ViewL (TOne, (:|)), tsingleton, tviewl, (><), (|>))
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (Identity))
@@ -45,6 +46,24 @@ inject _ = inj
 
 project :: (Member x r xs) => Proxy '(x, r) -> StackUnion xs h -> Maybe (h x r)
 project _ = prj
+
+data Membership x r xs = Membership
+    { inj' :: forall h. h x r -> StackUnion xs h
+    , prj' :: forall h. StackUnion xs h -> Maybe (h x r)
+    }
+
+here :: Membership x xs (x ': xs)
+here = Membership Here \case
+    Here x -> Just x
+    There _ -> Nothing
+
+there :: Membership x r xs -> Membership x r (x ': xs)
+there Membership{..} = Membership (There . inj') \case
+    Here _ -> Nothing
+    There xs -> prj' xs
+
+mkMembership :: (Member x r xs) => Membership x r xs
+mkMembership = Membership inj prj
 
 instance Member x xs (x : xs) where
     inj = Here
@@ -159,6 +178,9 @@ qApp q x = CtlT $ case tviewl q of
             Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
                 Control ctl q' -> Control ctl $ q' >< t
                 Abort r -> Abort r
+
+liftCtlT :: (Functor f) => f a -> CtlT fs f a
+liftCtlT a = CtlT $ Pure <$> a
 
 runCtlT :: (Functor f) => CtlT '[] f a -> f a
 runCtlT (CtlT m) =

@@ -65,7 +65,7 @@ library
     exposed-modules:
         Data.FTCQueue
         Control.Monad.MultiPrompt.Formal
-        Control.Effect.Env.Formal
+        Control.Monad.Effect
 
     -- Modules included in this library but not exported.
     -- other-modules:
