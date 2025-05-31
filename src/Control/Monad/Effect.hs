@@ -30,18 +30,28 @@ data Handlers (es :: [Frame]) m where
     Cons :: Handler e m -> Handlers es m -> Handlers (e : es) m
     Nil :: Handlers '[] m
 
+data Membership ff es ps = Membership
+    { getHandler :: forall m. Handlers es m -> Handler ('E ff ps) m
+    , updateHandler :: forall m. Handler ('E ff ps) m -> Handlers es m -> Handlers es m
+    }
+
 -- | Type-level search over elements in a vector.
 class Elem ff (es :: [Frame]) ps | ff es -> ps where
-    getHandler :: Handlers es m -> Handler ('E ff ps) m
-    updateHandler :: Handler ('E ff ps) m -> Handlers es m -> Handlers es m
+    membership :: Membership ff es ps
 
 instance Elem ff ('E ff ps : es) ps where
-    getHandler (Cons h _) = h
-    updateHandler h (Cons _ hs) = Cons h hs
+    membership =
+        Membership
+            { getHandler = \(Cons h _) -> h
+            , updateHandler = \h (Cons _ hs) -> Cons h hs
+            }
 
 instance {-# OVERLAPPABLE #-} (Elem ff es ps) => Elem ff ('E ff' ps' : es) ps where
-    getHandler (Cons _ hs) = getHandler hs
-    updateHandler h (Cons h' hs) = Cons h' $ updateHandler h hs
+    membership =
+        Membership
+            { getHandler = \(Cons _ hs) -> getHandler membership hs
+            , updateHandler = \h (Cons h' hs) -> Cons h' $ updateHandler membership h hs
+            }
 
 -- | Prepend to the handler vector.
 (!:) :: Handler e m -> Handlers es m -> Handlers (e : es) m
@@ -61,7 +71,7 @@ runEffT = C.runCtlT . interpretAll Nil
 runPure :: EffT '[] '[] Identity a -> a
 runPure = C.runPure . interpretAll Nil
 
-liftEffT :: CtlT fs m a -> EffT es fs m a
+liftEffT :: CtlT ps m a -> EffT es ps m a
 liftEffT m = EffT $ const m
 
 instance (Monad m) => Applicative (EffT es ps m) where
@@ -90,8 +100,16 @@ trans f (EffT withHandlerVec) = EffT $ withHandlerVec . f
 class HFunctor ff where
     hfmap :: (forall x. f x -> g x) -> ff f a -> ff g a
 
-send :: forall e es ps psSend m a. (Elem e es psSend, psSend < ps, HFunctor e, Monad m) => e (EffT es psSend m) a -> EffT es ps m a
-send e = EffT \v -> case getHandler v of Handler h -> embed $ h $ hfmap (interpretAll v) e
+send ::
+    forall e es ps psUnder m a.
+    (psUnder < ps, HFunctor e, Monad m) =>
+    Membership e es psUnder ->
+    e (EffT es psUnder m) a ->
+    EffT es ps m a
+send ix e =
+    EffT \v ->
+        case getHandler ix v of
+            Handler h -> embed $ h $ hfmap (interpretAll v) e
 
 prompt :: (Monad m) => EffT es (ans : ps) m ans -> EffT es ps m ans
 prompt (EffT m) = EffT \v -> C.prompt_ $ m v
@@ -145,17 +163,21 @@ runCatch = interpretTail \case
                     Left e -> run $ hdl e
                     x -> abort p x
 
-throw :: (Elem (Throw e) es r, r < ps, Monad b) => e -> EffT es ps b a
-throw = send . Throw
+perform :: (Elem e es psUnder) => (Membership e es psUnder -> r) -> r
+perform f = f membership
 
-catch :: (Elem (Catch e) es r, r < ps, Monad m) => EffT es r m a -> (e -> EffT es r m a) -> EffT es ps m a
-catch m h = send $ Catch m h
+throw :: forall e es r ps m a. (r < ps, Monad m) => Membership (Throw e) es r -> e -> EffT es ps m a
+throw i = send i . Throw
+
+catch :: forall e es r ps m a. (r < ps, Monad m) => Membership (Catch e) es r -> EffT es r m a -> (e -> EffT es r m a) -> EffT es ps m a
+catch i m h = send i $ Catch m h
 
 test :: Either String (Either Int Int)
 test = runPure . runThrow . runThrow . runCatch @String . runCatch @Int $ do
-    catch
+    perform
+        catch
         do
-            catch (throw @Int 123456) \(i :: Int) -> throw $ show i
+            perform catch (perform (throw @Int) 123456) \(i :: Int) -> perform throw $ show i
         \(s :: String) -> pure (length s)
 
 -- >>> test
