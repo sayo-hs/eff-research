@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -9,8 +10,9 @@
 
 module Control.Monad.Effect where
 
-import Control.Monad.MultiPrompt.Formal (CtlT, Member, Unlift (withRunInBase), abort, delimitAbort, embed, type (<))
+import Control.Monad.MultiPrompt.Formal (CtlT (CtlT), Member, PromptFrame (PromptFrame), Underlying, Unlift (withRunInBase), abort, delimitAbort, embed, hoistCtlT, weaken, type (<))
 import Control.Monad.MultiPrompt.Formal qualified as C
+import Control.Monad.Trans.Reader (ReaderT)
 import Data.Coerce (coerce)
 import Data.Data (Proxy (Proxy))
 import Data.Function ((&))
@@ -19,41 +21,38 @@ import Data.Kind (Type)
 import UnliftIO (MonadIO, MonadUnliftIO, liftIO, withRunInIO)
 
 type Effect = (Type -> Type) -> Type -> Type
-data EffectFrame = E Effect [Type]
-data Frames = Frames [EffectFrame] [Type]
+data EffectFrame = E Effect PromptFrame
 
-type family EffectFrameOf es where
-    EffectFrameOf ('Frames es _) = es
-
-type family PromptFrameOf es where
-    PromptFrameOf ('Frames _ ps) = ps
+type family PromptFrames es where
+    PromptFrames ('E _ p : es) = p : PromptFrames es
+    PromptFrames '[] = '[]
 
 -- | A effect handler.
-data Handler e m where
-    Handler :: (forall x. e (CtlT ps m) x -> CtlT ps m x) -> Handler ('E e ps) m
+data Handler e r m where
+    Handler :: (forall x. e (EnvCtlT r (p : Underlying p) m) x -> EnvCtlT r (p : Underlying p) m x) -> Handler ('E e p) r m
 
 -- | Vector of handlers.
-data Handlers (es :: [EffectFrame]) m where
-    Cons :: Handler e m -> Handlers es m -> Handlers (e : es) m
-    Nil :: Handlers '[] m
+data Handlers (es :: [EffectFrame]) r m where
+    Cons :: Handler e r m -> Handlers es r m -> Handlers (e : es) r m
+    Nil :: Handlers '[] r m
 
-data Membership ff es ps = Membership
-    { getHandler :: forall m. Handlers es m -> Handler ('E ff ps) m
-    , updateHandler :: forall m. Handler ('E ff ps) m -> Handlers es m -> Handlers es m
+data Membership ff es p = Membership
+    { getHandler :: forall r m. Handlers es r m -> Handler ('E ff p) r m
+    , updateHandler :: forall r m. Handler ('E ff p) r m -> Handlers es r m -> Handlers es r m
     }
 
 -- | Type-level search over elements in a vector.
-class Elem ff (es :: [EffectFrame]) ps | ff es -> ps where
-    membership :: Membership ff es ps
+class Elem ff (es :: [EffectFrame]) p | ff es -> p where
+    membership :: Membership ff es p
 
-instance Elem ff ('E ff ps : es) ps where
+instance Elem ff ('E ff p : es) p where
     membership =
         Membership
             { getHandler = \(Cons h _) -> h
             , updateHandler = \h (Cons _ hs) -> Cons h hs
             }
 
-instance {-# OVERLAPPABLE #-} (Elem ff es ps) => Elem ff ('E ff' ps' : es) ps where
+instance {-# OVERLAPPABLE #-} (Elem ff es p) => Elem ff ('E ff' p' : es) p where
     membership =
         Membership
             { getHandler = \(Cons _ hs) -> getHandler membership hs
@@ -61,14 +60,50 @@ instance {-# OVERLAPPABLE #-} (Elem ff es ps) => Elem ff ('E ff' ps' : es) ps wh
             }
 
 -- | Prepend to the handler vector.
-(!:) :: Handler e m -> Handlers es m -> Handlers (e : es) m
+(!:) :: Handler e r m -> Handlers es r m -> Handlers (e : es) r m
 (!:) = Cons
 
--- | An effect monad transformer built on top of a multi-prompt/control monad.
-newtype EffT es m a
-    = EffT {unEffT :: Handlers (EffectFrameOf es) m -> CtlT (PromptFrameOf es) m a}
-    deriving (Functor)
+newtype EnvCtlT r ps (m :: Type -> Type) a = EnvCtlT {unEnvCtlT :: ReaderT r (CtlT ps (EnvCtlT r ps m)) a}
+    deriving (Functor, Applicative, Monad)
 
+{-
+runEnvT :: Handlers es m -> EnvT es m a -> m a
+runEnvT = flip unEnvT
+
+liftEnvT :: m a -> EnvT es m a
+liftEnvT m = EnvT $ const m
+
+instance (Applicative m) => Applicative (EnvT es m) where
+    pure x = EnvT \_ -> pure x
+    EnvT ff <*> EnvT fa = EnvT \v -> ff v <*> fa v
+
+instance (Monad m) => Monad (EnvT es m) where
+    EnvT m >>= f = EnvT \v -> m v >>= runEnvT v . f
+
+instance (MonadIO m) => MonadIO (EnvT es m) where
+    liftIO m = EnvT \_ -> liftIO m
+
+instance (MonadUnliftIO m) => MonadUnliftIO (EnvT es m) where
+    withRunInIO f = EnvT \v -> withRunInIO \run -> f $ run . runEnvT v
+
+instance (Unlift b f) => Unlift b (EnvT es f) where
+    withRunInBase f = EnvT \v -> withRunInBase \run -> f $ run . runEnvT v
+
+-- | An effect monad transformer built on top of a multi-prompt/control monad.
+newtype EffT es m a = EffT {unEffT :: EnvT es (CtlT (PromptFrames es) (EnvT es m)) a}
+    deriving (Functor, Applicative, Monad, MonadIO)
+
+deriving instance (MonadUnliftIO m, PromptFrames es ~ '[]) => MonadUnliftIO (EffT es m)
+deriving instance (Unlift b f, PromptFrames es ~ '[], Functor f) => Unlift b (EffT es f)
+
+overwrite :: CtlT (PromptFrames es) (EnvT es m) a -> EffT es m a
+overwrite (CtlT (EnvT m)) = EffT $ EnvT \v -> undefined
+
+interpret :: (Monad m) => Handler e (EffT es m) -> EffT (e : es) m a -> EffT es m a
+interpret (Handler h) (EffT (EnvT m)) = EffT $ EnvT \v -> undefined $ m $ Handler (hoistCtlT (undefined . runEnvT v . unEffT) undefined . h . undefined) !: undefined v
+-}
+
+{-
 interpretAll :: Handlers es m -> EffT ('Frames es ps) m a -> CtlT ps m a
 interpretAll = flip unEffT
 
@@ -80,25 +115,6 @@ runPure = C.runPure . interpretAll Nil
 
 liftEffT :: CtlT ps m a -> EffT ('Frames es ps) m a
 liftEffT m = EffT $ const m
-
-instance (Monad m) => Applicative (EffT es m) where
-    pure x = EffT \_ -> pure x
-    EffT ff <*> EffT fa = EffT \v -> ff v <*> fa v
-
-instance (Monad m) => Monad (EffT ('Frames es ps) m) where
-    EffT m >>= f = EffT \v -> m v >>= interpretAll v . f
-
-instance (MonadIO m) => MonadIO (EffT ('Frames es ps) m) where
-    liftIO m = EffT \_ -> liftIO m
-
-instance (MonadUnliftIO m) => MonadUnliftIO (EffT ('Frames es '[]) m) where
-    withRunInIO f = EffT \v -> withRunInIO \run -> f $ run . interpretAll v
-
-instance (Unlift b f, Functor f) => Unlift b (EffT ('Frames es '[]) f) where
-    withRunInBase f = EffT \v -> withRunInBase \run -> f $ run . interpretAll v
-
-withEffToCtl :: ((forall x. EffT ('Frames es ps) m x -> CtlT ps m x) -> CtlT ps m a) -> EffT ('Frames es ps) m a
-withEffToCtl f = EffT \v -> f (interpretAll v)
 
 trans :: (Handlers es' m -> Handlers es m) -> EffT ('Frames es ps) m a -> EffT ('Frames es' ps) m a
 trans f (EffT withHandlerVec) = EffT $ withHandlerVec . f
@@ -118,13 +134,13 @@ send ix e =
         case getHandler ix v of
             Handler h -> embed $ h $ hfmap (interpretAll v) e
 
-prompt :: (Monad m) => EffT ('Frames es (ans : ps)) m ans -> EffT ('Frames es ps) m ans
+prompt :: (Monad m) => EffT ('Frames es ('PromptFrame ans ps : ps)) m ans -> EffT ('Frames es ps) m ans
 prompt (EffT m) = EffT \v -> C.prompt_ $ m v
 
 interpret ::
     (HFunctor e, Monad m) =>
-    (forall x. Proxy ps -> e (EffT ('Frames es (ans : ps)) m) x -> EffT ('Frames es (ans : ps)) m x) ->
-    EffT ('Frames ('E e (ans : ps) : es) (ans : ps)) m ans ->
+    (forall x. Proxy ('PromptFrame ans ps : ps) -> e (EffT ('Frames es ('PromptFrame ans ps : ps)) m) x -> EffT ('Frames es ('PromptFrame ans ps : ps)) m x) ->
+    EffT ('Frames ('E e ('PromptFrame ans ps : ps) : es) ('PromptFrame ans ps : ps)) m ans ->
     EffT ('Frames es ps) m ans
 interpret f m = EffT \v -> interpretAll v $ prompt $ trans (Handler (interpretAll v . f Proxy . hfmap liftEffT) !:) m
 
@@ -151,7 +167,7 @@ instance HFunctor (Catch e) where
 runThrow ::
     forall m e a ps es.
     (Monad m) =>
-    EffT ('Frames ('E (Throw e) (Either e a : ps) : es) (Either e a : ps)) m a ->
+    EffT ('Frames ('E (Throw e) ('PromptFrame (Either e a) ps : ps) : es) ('PromptFrame (Either e a) ps : ps)) m a ->
     EffT ('Frames es ps) m (Either e a)
 runThrow m =
     Right <$> m & interpret \p -> \case
@@ -159,13 +175,13 @@ runThrow m =
 
 runCatch ::
     forall e m a ps es ans r.
-    (Member (Either e ans) r ps, Elem (Throw e) es (Either e ans ': r), Monad m) =>
+    (Member ('PromptFrame (Either e ans) ps) r, Elem (Throw e) es r, Monad m) =>
     EffT ('Frames ('E (Catch e) ps : es) ps) m a ->
     EffT ('Frames es ps) m a
 runCatch = interpretTail \case
     Catch m' hdl ->
         withEffToCtl \run ->
-            let p = Proxy @r
+            let p = Proxy @('PromptFrame (Either e ans) ps)
              in delimitAbort p (run m') \case
                     Left e -> run $ hdl e
                     x -> abort p x
@@ -189,3 +205,4 @@ test = runPure . runThrow . runThrow . runCatch @String . runCatch @Int $ do
 
 -- >>> test
 -- Right (Right 6)
+-}

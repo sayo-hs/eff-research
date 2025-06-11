@@ -84,6 +84,7 @@ library
         base ^>=4.19.2.0,
         data-effects,
         unliftio,
+        transformers,
 
     -- Directories containing source files.
     hs-source-dirs:   src
