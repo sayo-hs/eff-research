@@ -1,6 +1,9 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use fmap" #-}
 
 -- SPDX-License-Identifier: MPL-2.0
 
@@ -14,9 +17,10 @@ A fully type-safe multi-prompt/control monad, inspired by [speff](https://github
 module Control.Monad.MultiPrompt.Formal where
 
 import Control.Monad (ap)
+import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.FTCQueue (FTCQueue (..), ViewL (TOne, (:|)), tsingleton, tviewl, (><), (|>))
 import Data.Functor ((<&>))
-import Data.Functor.Identity (Identity (Identity))
+import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 import UnliftIO (MonadIO, MonadUnliftIO (withRunInIO), liftIO)
@@ -75,138 +79,142 @@ type family Answer p where
 type family Underlying p where
     Underlying ('PromptFrame _ u) = u
 
-{- | A type-safe multi-prompt/control monad transformer.
+{- | A type-safe multi-prompt/control monad transformer with reader environment.
 
-    @frames@: A list of the current prompt stack frames.
+    @ps@: A list of the current prompt stack frames.
+
+    @r@: The reader environment.
 
     @m@: The base monad.
 -}
-newtype CtlT (ps :: [PromptFrame]) m a = CtlT {unCtlT :: m (CtlResult ps m a)}
+newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: r -> m (CtlResult ps r m a)}
 
-data CtlResult ps m a
+mapEnv :: (Monad m) => (r -> r') -> (r' -> r) -> CtlT ps r' m a -> CtlT ps r m a
+mapEnv f g (CtlT m) = CtlT \v ->
+    m (f v) <&> \case
+        Pure x -> Pure x
+        Ctl ctls -> Ctl $ forUnion ctls \case
+            Abort r -> Abort r
+            Control ctl q -> Control (mapEnv f g . ctl . (mapEnv g f .)) (tsingleton $ mapEnv f g . qApp q)
+
+data CtlResult ps r m a
     = Pure a
-    | Ctl (Ctls ps m a)
+    | Ctl (Ctls ps r m a)
 
-type Ctls ps m a = Union ps (CtlFrame ps m a)
+type Ctls ps r m a = Union ps (CtlFrame ps r m a)
 
-data CtlFrame (ps :: [PromptFrame]) (m :: Type -> Type) (a :: Type) (p :: PromptFrame) where
-    Abort :: Answer p -> CtlFrame ps m a p
-    Control :: ((b -> CtlT (Underlying p) m (Answer p)) -> CtlT (Underlying p) m (Answer p)) -> FTCQueue (CtlT ps m) b a -> CtlFrame ps m a p
+data CtlFrame (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) where
+    Abort :: Answer p -> CtlFrame ps r m a p
+    Control :: ((b -> CtlT (Underlying p) r m (Answer p)) -> CtlT (Underlying p) r m (Answer p)) -> FTCQueue (CtlT ps r m) b a -> CtlFrame ps r m a p
 
-instance (Applicative f) => Functor (CtlResult frames f) where
+instance (Applicative f) => Functor (CtlResult frames r f) where
     fmap f = \case
         Pure x -> Pure $ f x
         Ctl ctls -> Ctl $ forUnion ctls \case
             Abort ans -> Abort ans
-            Control ctl q -> Control ctl $ q |> (CtlT . pure . Pure . f)
+            Control ctl q -> Control ctl $ q |> (CtlT . const . pure . Pure . f)
 
-instance (Applicative f) => Functor (CtlT fs f) where
-    fmap f (CtlT m) = CtlT $ fmap f <$> m
+instance (Applicative f) => Functor (CtlT fs r f) where
+    fmap f (CtlT m) = CtlT $ fmap (fmap f) . m
 
-instance (Monad m) => Applicative (CtlT fs m) where
-    pure = CtlT . pure . Pure
+instance (Monad m) => Applicative (CtlT fs r m) where
+    pure = CtlT . const . pure . Pure
     (<*>) = ap
 
-instance (Monad m) => Monad (CtlT fs m) where
+instance (Monad m) => Monad (CtlT fs r m) where
     CtlT m >>= f =
-        CtlT $
-            m >>= \case
-                Pure x -> unCtlT $ f x
+        CtlT \v ->
+            m v >>= \case
+                Pure x -> unCtlT (f x) v
                 Ctl ctls -> pure $ Ctl $ forUnion ctls \case
                     Abort a -> Abort a
                     Control ctl q -> Control ctl $ q |> f
 
-instance (MonadIO m) => MonadIO (CtlT fs m) where
-    liftIO m = CtlT $ liftIO $ Pure <$> m
+instance (MonadIO m) => MonadIO (CtlT fs r m) where
+    liftIO m = CtlT $ const $ liftIO $ Pure <$> m
 
-instance (MonadUnliftIO m) => MonadUnliftIO (CtlT '[] m) where
-    withRunInIO f = CtlT $ withRunInIO \run -> Pure <$> f (run . runCtlT)
+instance (MonadUnliftIO m) => MonadUnliftIO (CtlT '[] r m) where
+    withRunInIO f = CtlT \v -> withRunInIO \run -> Pure <$> f (run . runCtlT v)
 
 class Unlift b m where
     withRunInBase :: ((forall x. m x -> b x) -> b a) -> m a
 
-instance (Unlift b f, Functor f) => Unlift b (CtlT '[] f) where
-    withRunInBase f = CtlT $ Pure <$> withRunInBase \run -> f (run . runCtlT)
+instance (Unlift b f) => Unlift b (ReaderT r f) where
+    withRunInBase f = ReaderT \v -> withRunInBase \run -> f $ run . flip runReaderT v
 
-prompt :: (Monad m) => CtlT ('PromptFrame ans ps : ps) m ans -> CtlT ps m ans
+instance (Unlift b f, Functor f) => Unlift b (CtlT '[] r f) where
+    withRunInBase f = CtlT \v -> Pure <$> withRunInBase \run -> f (run . runCtlT v)
+
+prompt :: (Monad m) => CtlT ('PromptFrame ans ps : ps) r m ans -> CtlT ps r m ans
 prompt (CtlT m) =
-    CtlT $
-        m >>= \case
+    CtlT \v ->
+        m v >>= \case
             Pure x -> pure $ Pure x
             Ctl ctls -> case ctls of
-                Here (Control ctl q) -> unCtlT $ ctl $ prompt . qApp q
+                Here (Control ctl q) -> unCtlT (ctl $ prompt . qApp q) v
                 Here (Abort ans) -> pure $ Pure ans
                 There ctls' -> pure $ Ctl $ forUnion ctls' \case
                     (Control ctl q) -> Control ctl (tsingleton $ prompt . qApp q)
                     Abort r -> Abort r
 
-prompt_ :: (Monad m) => (forall p. Proxy p -> CtlT (p : ps) m ans) -> CtlT ps m ans
+prompt_ :: (Monad m) => (forall p. Proxy p -> CtlT (p : ps) r m ans) -> CtlT ps r m ans
 prompt_ f = prompt $ f Proxy
 
-control :: (Member p ps, Applicative m) => Proxy p -> ((a -> CtlT (Underlying p) m (Answer p)) -> CtlT (Underlying p) m (Answer p)) -> CtlT ps m a
-control p f = CtlT . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . pure . Pure)
+control :: (Member p ps, Applicative m) => Proxy p -> ((a -> CtlT (Underlying p) r m (Answer p)) -> CtlT (Underlying p) r m (Answer p)) -> CtlT ps r m a
+control p f = CtlT . const . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . const . pure . Pure)
 
 delimitAbort ::
-    forall ps m a p.
+    forall ps r m a p.
     (Member p ps, Monad m) =>
     Proxy p ->
-    CtlT ps m a ->
-    (Answer p -> CtlT ps m a) ->
-    CtlT ps m a
+    CtlT ps r m a ->
+    (Answer p -> CtlT ps r m a) ->
+    CtlT ps r m a
 delimitAbort p (CtlT m) k =
-    CtlT $
-        m >>= \case
+    CtlT \v ->
+        m v >>= \case
             Pure x -> pure $ Pure x
             Ctl ctls -> case project p ctls of
-                Just (Abort r) -> unCtlT $ k r
+                Just (Abort r) -> unCtlT (k r) v
                 _ -> pure $ Ctl ctls
 
-abort :: (Member p ps, Applicative f) => Proxy p -> Answer p -> CtlT ps f a
-abort p = CtlT . pure . Ctl . inject p . Abort
+abort :: (Member p ps, Applicative f) => Proxy p -> Answer p -> CtlT ps r f a
+abort p = CtlT . const . pure . Ctl . inject p . Abort
 
-embed :: (p : Underlying p < ps, Monad m) => Proxy p -> CtlT (p : Underlying p) m a -> CtlT ps m a
+embed :: (u < ps, Monad m) => Proxy p -> CtlT u r m a -> CtlT ps r m a
 embed p (CtlT m) =
-    CtlT $
-        m <&> \case
+    CtlT \v ->
+        m v <&> \case
             Pure x -> Pure x
             Ctl ctls -> Ctl $ forUnion (weaken ctls) \case
                 Abort ans -> Abort ans
                 Control ctl q -> Control ctl $ tsingleton $ embed p . qApp q
 
-qApp :: (Monad m) => FTCQueue (CtlT ps m) a b -> a -> CtlT ps m b
-qApp q x = CtlT $ case tviewl q of
-    TOne k -> unCtlT $ k x
+qApp :: (Monad m) => FTCQueue (CtlT ps r m) a b -> a -> CtlT ps r m b
+qApp q x = CtlT \v -> case tviewl q of
+    TOne k -> unCtlT (k x) v
     k :| t ->
-        unCtlT (k x) >>= \case
-            Pure y -> unCtlT $ qApp t y
+        unCtlT (k x) v >>= \case
+            Pure y -> unCtlT (qApp t y) v
             Ctl ctls -> pure $ Ctl $ forUnion ctls \case
                 Control ctl q' -> Control ctl $ q' >< t
                 Abort r -> Abort r
 
-liftCtlT :: (Functor f) => f a -> CtlT fs f a
-liftCtlT a = CtlT $ Pure <$> a
+liftCtlT :: (Functor f) => f a -> CtlT fs r f a
+liftCtlT a = CtlT $ const $ Pure <$> a
 
-runCtlT :: (Functor f) => CtlT '[] f a -> f a
-runCtlT (CtlT m) =
-    m <&> \case
+runCtlT :: (Functor f) => r -> CtlT '[] r f a -> f a
+runCtlT v (CtlT m) =
+    m v <&> \case
         Pure x -> x
         Ctl ctls -> case ctls of {}
 
-runPure :: CtlT '[] Identity a -> a
-runPure (CtlT (Identity m)) = case m of
+runPure :: r -> CtlT '[] r Identity a -> a
+runPure v (CtlT m) = case runIdentity $ m v of
     Pure x -> x
     Ctl ctls -> case ctls of {}
 
-hoistCtlT :: (Monad m, Monad n) => (forall x. m x -> n x) -> (forall x. n x -> m x) -> CtlT ps m a -> CtlT ps n a
-hoistCtlT to from (CtlT m) =
-    CtlT $
-        to m <&> \case
-            Pure x -> Pure x
-            Ctl ctls -> Ctl $ forUnion ctls \case
-                Abort r -> Abort r
-                Control ctl q -> Control (hoistCtlT to from . ctl . (hoistCtlT from to .)) (tsingleton $ hoistCtlT to from . qApp q)
+data Status ps v m r = Done r | Continue (CtlT ps v m (Status ps v m r))
 
-data Status ps m r = Done r | Continue (CtlT ps m (Status ps m r))
-
-yield :: (Member p ps, Monad m, Answer p ~ Status (Underlying p) m r) => Proxy p -> CtlT ps m ()
+yield :: (Member p ps, Monad m, Answer p ~ Status (Underlying p) v m r) => Proxy p -> CtlT ps v m ()
 yield p = control p \k -> pure $ Continue $ k ()
