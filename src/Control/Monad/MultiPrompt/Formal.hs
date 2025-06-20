@@ -151,6 +151,14 @@ control p@Refl f = CtlT . pure . Ctl . inject p $ PrimOp $ Control f (tsingleton
 abort :: forall p ans u ps m a. (Member p ps, Monad m) => p :~: Prompt ans u -> ans -> CtlT ps m a
 abort p ans = control p \_ -> pure ans
 
+under :: (Member p ps, Monad m) => p :~: Prompt ans u -> CtlT u m a -> CtlT ps m a
+under p@Refl (CtlT m) =
+    CtlT $
+        m <&> \case
+            Pure x -> Pure x
+            Ctl ctls -> Ctl $ inject p $ Under $ forCtls ctls \case
+                Control ctl q -> Control ctl (tsingleton $ under p . qApp q)
+
 qApp :: (Monad m) => FTCQueue (CtlT ps m) a b -> a -> CtlT ps m b
 qApp q x = CtlT $ case tviewl q of
     TOne k -> unCtlT (k x)
