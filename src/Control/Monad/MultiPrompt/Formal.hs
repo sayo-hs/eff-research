@@ -61,18 +61,7 @@ instance {-# OVERLAPPABLE #-} (Member x xs) => Member x (x' : xs) where
         Here _ -> Nothing
         There xs -> prj xs
 
-infix 4 <
-
-class xs < ys where
-    weaken :: Union xs h -> Union ys h
-
-instance xs < xs where
-    weaken = id
-
-instance {-# INCOHERENT #-} (xs < ys) => xs < y : ys where
-    weaken = There . weaken
-
-type data PromptFrame = Prompt Type Type [PromptFrame]
+type data PromptFrame = Prompt Type [PromptFrame]
 
 {- | A type-safe multi-prompt/control monad transformer with reader environment.
 
@@ -84,6 +73,7 @@ type data PromptFrame = Prompt Type Type [PromptFrame]
 -}
 newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: r -> m (CtlResult ps r m a)}
 
+{-
 mapEnv :: (Monad m) => (r -> r') -> CtlT ps r' m a -> CtlT ps r m a
 mapEnv f (CtlT m) = CtlT \v ->
     m (f v) <&> \case
@@ -91,6 +81,7 @@ mapEnv f (CtlT m) = CtlT \v ->
         Ctl ctls -> Ctl $ forCtls ctls \case
             Abort r -> Abort r
             Control ctl q -> Control ctl (tsingleton $ mapEnv f . qApp q)
+-}
 
 data CtlResult ps r m a
     = Pure a
@@ -100,11 +91,10 @@ type Ctls ps r m a = Union ps (CtlFrame ps r m a)
 
 data CtlFrame (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) where
     PrimOp :: PrimOp ps r m a p -> CtlFrame ps r m a p
-    Under :: Union u (CtlFrame ps r m a) -> CtlFrame ps r m a (Prompt ans r' u)
+    Under :: Union u (CtlFrame ps r m a) -> CtlFrame ps r m a (Prompt ans u)
 
 data PrimOp (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) where
-    Abort :: ans -> PrimOp ps r m a (Prompt ans r' u)
-    Control :: ((b -> CtlT u r' m ans) -> CtlT u r' m ans) -> FTCQueue (CtlT ps r m) b a -> PrimOp ps r m a (Prompt ans r' u)
+    Control :: ((b -> CtlT u r m ans) -> CtlT u r m ans) -> FTCQueue (CtlT ps r m) b a -> PrimOp ps r m a (Prompt ans u)
 
 mapCtls :: (forall x. PrimOp ps r m a x -> PrimOp ps' r' m' a' x) -> Union xs (CtlFrame ps r m a) -> Union xs (CtlFrame ps' r' m' a')
 mapCtls f = mapUnion \case
@@ -114,7 +104,8 @@ mapCtls f = mapUnion \case
 forCtls :: Union xs (CtlFrame ps r m a) -> (forall x. PrimOp ps r m a x -> PrimOp ps' r' m' a' x) -> Union xs (CtlFrame ps' r' m' a')
 forCtls u f = mapCtls f u
 
-under :: (Member p ps, Monad m) => p :~: Prompt ans r' u -> (r -> r') -> r' -> CtlT u r' m a -> CtlT ps r m a
+{-
+under :: (Member p ps, Monad m) => p :~: Prompt ans u -> (r -> r') -> r' -> CtlT u r' m a -> CtlT ps r m a
 under p@Refl f v (CtlT m) =
     CtlT \_ ->
         m v <&> \case
@@ -234,3 +225,4 @@ test = runCtlT () do
             _ <- resume $ x + 1
             pure ()
         Done () -> pure ()
+-}
