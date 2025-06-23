@@ -141,22 +141,22 @@ instance {-# OVERLAPPABLE #-} (Elem ff es p) => Elem ff (E ff' p' : es) p where
             }
 
 sendCtl ::
-    (Member (Prompt ans r u) ps, Monad m, EnvFunctor e) =>
-    p :~: Prompt ans r u ->
+    (Member (Prompt ans r u) ps, Monad m, EnvFunctor e, p ~ Prompt ans r u) =>
+    Proxy p ->
     Membership e es (Ctl p) ->
     e (EffCtlT (p : u) es m) a ->
     EffCtlT ps es m a
-sendCtl p@Refl i e = CtlT \r@(Env hs) -> case getHandler i hs of
+sendCtl p i e = CtlT \r@(Env hs) -> case getHandler i hs of
     CtlHandler h r' ->
         unCtlT (under p (\(Env hs') -> case getHandler i hs' of CtlHandler _ r'' -> r'') r' $ h e) r
 
 interpretCtl ::
     (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall p x. p :~: Prompt a (Env es m) ps -> e (EffCtlT (p : ps) es m) x -> EffCtlT (p : ps) es m x) ->
-    (forall p. p :~: Prompt a (Env es m) ps -> EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
+    (forall p x. (p ~ Prompt a (Env es m) ps) => Proxy p -> e (EffCtlT (p : ps) es m) x -> EffCtlT (p : ps) es m x) ->
+    (forall p. (p ~ Prompt a (Env es m) ps) => Proxy p -> EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
     EffCtlT ps es m a
 interpretCtl h m =
-    prompt (\r -> CtlHandler (h Refl) r !: r) \Refl -> m Refl
+    prompt (\r -> CtlHandler (h Proxy) r !: r) \p -> m p
 
 interpretBy ::
     (Monad m, EnvFunctor e, EnvFunctors es) =>

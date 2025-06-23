@@ -23,7 +23,7 @@ import Data.FTCQueue (FTCQueue (..), ViewL (TOne, (:|)), tsingleton, tviewl, (><
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity, runIdentity)
 import Data.Kind (Type)
-import Data.Type.Equality ((:~:) (Refl))
+import Data.Proxy (Proxy (Proxy))
 import UnliftIO (MonadIO, MonadUnliftIO (withRunInIO), liftIO)
 
 -- | An type-safe open union.
@@ -43,10 +43,10 @@ class Member x xs where
     inj :: h x -> Union xs h
     prj :: Union xs h -> Maybe (h x)
 
-inject :: (Member x xs) => x :~: y -> h x -> Union xs h
+inject :: (Member x xs) => Proxy x -> h x -> Union xs h
 inject _ = inj
 
-project :: (Member x xs) => x :~: y -> Union xs h -> Maybe (h x)
+project :: (Member x xs) => Proxy x -> Union xs h -> Maybe (h x)
 project _ = prj
 
 instance Member x (x : xs) where
@@ -141,30 +141,30 @@ prompt ::
     forall r r' ps m ans.
     (Monad m) =>
     (r' -> r) ->
-    (forall p. p :~: Prompt ans r' ps -> CtlT (p : ps) r m ans) ->
+    (forall p. (p ~ Prompt ans r' ps) => Proxy p -> CtlT (p : ps) r m ans) ->
     CtlT ps r' m ans
 prompt f m =
     CtlT \r ->
-        unCtlT (m Refl) (f r) >>= \case
+        unCtlT (m Proxy) (f r) >>= \case
             Pure x -> pure $ Pure x
             Ctl ctls -> case ctls of
-                Here (PrimOp (Control ctl q)) -> unCtlT (ctl \x -> prompt f \Refl -> qApp q x) r
+                Here (PrimOp (Control ctl q)) -> unCtlT (ctl \x -> prompt f \_ -> qApp q x) r
                 Here (Under u) -> promptUnder u
                 There u -> promptUnder u
   where
     promptUnder :: Union ps (CtlFrame (Prompt ans r' ps : ps) r m ans) -> m (CtlResult ps r' m ans)
     promptUnder u =
         pure $ Ctl $ forCtls u \case
-            Control ctl q -> Control ctl $ tsingleton \x -> prompt f \Refl -> qApp q x
+            Control ctl q -> Control ctl $ tsingleton \x -> prompt f \_ -> qApp q x
 
-control :: (Member p ps, Applicative m) => p :~: Prompt ans r' u -> ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> CtlT ps r m a
-control p@Refl f = CtlT . const . pure . Ctl . inject p $ PrimOp $ Control f (tsingleton $ CtlT . const . pure . Pure)
+control :: (Member p ps, Applicative m, p ~ Prompt ans r' u) => Proxy p -> ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> CtlT ps r m a
+control p f = CtlT . const . pure . Ctl . inject p $ PrimOp $ Control f (tsingleton $ CtlT . const . pure . Pure)
 
-abort :: (Member p ps, Monad m) => p :~: Prompt ans r' u -> ans -> CtlT ps r m a
+abort :: (Member p ps, Monad m, p ~ Prompt ans r' u) => Proxy p -> ans -> CtlT ps r m a
 abort p ans = control p \_ -> pure ans
 
-under :: (Member p ps, Monad m) => p :~: Prompt ans r' u -> (r -> r') -> r' -> CtlT (p : u) r' m a -> CtlT ps r m a
-under p@Refl f r (CtlT m) =
+under :: (Member p ps, Monad m, p ~ Prompt ans r' u) => Proxy p -> (r -> r') -> r' -> CtlT (p : u) r' m a -> CtlT ps r m a
+under p f r (CtlT m) =
     CtlT \_ ->
         m r <&> \case
             Pure x -> Pure x
@@ -176,8 +176,8 @@ under p@Refl f r (CtlT m) =
     mkUnder ctls = Under $ forCtls ctls \case
         Control ctl q -> Control ctl (tsingleton $ underk p f $ qApp q)
 
-underk :: (Member p ps, Monad m) => p :~: Prompt ans r' u -> (r -> r') -> (b -> CtlT (p : u) r' m a) -> (b -> CtlT ps r m a)
-underk p@Refl f k x = CtlT \r -> unCtlT (under p f (f r) $ k x) r
+underk :: (Member p ps, Monad m, p ~ Prompt ans r' u) => Proxy p -> (r -> r') -> (b -> CtlT (p : u) r' m a) -> (b -> CtlT ps r m a)
+underk p f k x = CtlT \r -> unCtlT (under p f (f r) $ k x) r
 
 qApp :: (Monad m) => FTCQueue (CtlT ps r m) a b -> a -> CtlT ps r m b
 qApp q x = CtlT \r -> case tviewl q of
@@ -204,12 +204,12 @@ runPure r (CtlT m) = case runIdentity (m r) of
 
 data Status a b ps v m r = Done r | Continue a (b -> CtlT ps v m (Status a b ps v m r))
 
-yield :: (Member p ps, Monad m) => p :~: Prompt (Status a b u v m r) v u -> a -> CtlT ps v m b
+yield :: (Member p ps, Monad m, p ~ Prompt (Status a b u v m r) v u) => Proxy p -> a -> CtlT ps v m b
 yield p x = control p \k -> pure $ Continue x k
 
 runCoroutine ::
     (Monad m) =>
-    (forall p. p :~: Prompt (Status a b ps v m r) v ps -> CtlT (p : ps) v m r) ->
+    (forall p. (p ~ Prompt (Status a b ps v m r) v ps) => Proxy p -> CtlT (p : ps) v m r) ->
     CtlT ps v m (Status a b ps v m r)
 runCoroutine f = prompt id \p -> Done <$> f p
 
