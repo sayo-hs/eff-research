@@ -162,6 +162,21 @@ under p@Refl (CtlT m) =
             Ctl ctls -> Ctl $ inject p $ Under $ forCtls ctls \case
                 Control ctl q -> Control ctl (tsingleton $ under p . qApp q)
 
+under' :: (Member p ps, Monad m) => p :~: Prompt ans u -> CtlT (p : u) m a -> CtlT ps m a
+under' p@Refl (CtlT m) =
+    CtlT $
+        m <&> \case
+            Pure x -> Pure x
+            Ctl (Here (PrimOp (Control ctl q))) ->
+                Ctl $
+                    inject p $
+                        PrimOp $
+                            Control ctl (tsingleton $ under' p . qApp q)
+            Ctl (Here (Under ctls)) -> Ctl $ inject p $ Under $ forCtls ctls \case
+                Control ctl q -> Control ctl (tsingleton $ under' p . qApp q)
+            Ctl (There ctls) -> Ctl $ inject p $ Under $ forCtls ctls \case
+                Control ctl q -> Control ctl (tsingleton $ under' p . qApp q)
+
 qApp :: (Monad m) => FTCQueue (CtlT ps m) a b -> a -> CtlT ps m b
 qApp q x = CtlT $ case tviewl q of
     TOne k -> unCtlT (k x)

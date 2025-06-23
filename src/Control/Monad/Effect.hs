@@ -15,7 +15,7 @@
 module Control.Monad.Effect where
 
 import Control.Monad.MultiPrompt.Formal
-import Control.Monad.Trans.Reader (ReaderT (ReaderT))
+import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.Coerce (Coercible, coerce)
 import Data.Data (Proxy (Proxy), (:~:) (Refl))
 import Data.FTCQueue
@@ -93,8 +93,12 @@ type CtlEnvT ps es m = CtlReaderT ps (Env es m) m
 
 -- | A type-class for higher-order effects.
 class EnvFunctor ff where
-    mapEnv :: (Monad m, EnvFunctors es, EnvFunctors es') => (Env es m -> Env es' m) -> (Env es' m -> Env es m) -> ff (CtlEnvT u es m) a -> ff (CtlEnvT u es' m) a
-    underEnv :: (Monad m) => (Member p ps, EnvFunctors es) => p :~: Prompt ans u -> ff (CtlEnvT u es m) a -> ff (CtlEnvT ps es m) a
+    mapEnv ::
+        (Monad m, EnvFunctors es, EnvFunctors es') =>
+        (Env es m -> Env es' m) ->
+        (Env es' m -> Env es m) ->
+        ff (CtlEnvT u es m) a ->
+        ff (CtlEnvT u es' m) a
 
 -- | Prepend to the handler vector environment.
 (!:) :: (EnvFunctors es, EnvFunctor ff, Monad m) => Handler (E ff r) (Env es m) m -> Env es m -> Env (E ff r : es) m
@@ -175,6 +179,15 @@ interpretBy ret hdl m =
 
 raise :: (Monad m) => EffT es m a -> EffT (E e (Ctl p) : es) m a
 raise (EffT m) = EffT $ raiseCtlT $ mapCtlReaderT undefined undefined m
+
+sendCtl ::
+    (Member (Prompt ans u) (PromptFrames es), Monad m) =>
+    p :~: Prompt ans u ->
+    Membership e es (Ctl p) ->
+    e (CtlEnvT (p : u) es m) a ->
+    EffT es m a
+sendCtl p@Refl i e = EffT $ CtlT $ ReaderT \r@(Env v) -> case getHandler i v of
+    CtlHandler h -> runReaderT (unCtlT $ under' p $ h e) r
 
 {-
 interpretCtl ::
@@ -283,11 +296,9 @@ data Test1 :: Effect where
 
 instance EnvFunctor Test1 where
     mapEnv f g (Test1 m) = Test1 $ mapSubEnv g f m
-    underEnv _ (Test1 m) = Test1 m
 
 data Test2 :: Effect where
     Test2 :: (EnvFunctor e) => (forall u. CtlEnvT ps (E e u : es) m a) -> Test2 (CtlEnvT ps es m) a
 
 instance EnvFunctor Test2 where
     mapEnv f g (Test2 m) = Test2 $ mapSubEnv g f m
-    underEnv p (Test2 m) = Test2 $ under p m
