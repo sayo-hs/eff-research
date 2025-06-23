@@ -68,32 +68,57 @@ newtype Env es m = Env {unEnv :: Handlers es es m}
 -- | A type-class for higher-order effects.
 class EnvFunctor e where
     mapEnv ::
-        (Monad m) =>
+        (Monad m, EnvFunctors es1, EnvFunctors es2) =>
+        Env es1 m ->
         (Env es1 m -> Env es2 m) ->
         e (EffCtlT u es1 m) a ->
         e (EffCtlT u es2 m) a
 
-cmapHandler :: (EnvFunctor e, Monad m) => (Env es1 m -> Env es2 m) -> Handler (E e r) es2 m -> Handler (E e r) es1 m
-cmapHandler f = \case
-    CtlHandler h v -> CtlHandler (h . mapEnv f) v
+cmapHandler ::
+    (EnvFunctor e, Monad m, EnvFunctors es1, EnvFunctors es2) =>
+    Env es1 m ->
+    (Env es1 m -> Env es2 m) ->
+    Handler (E e r) es2 m ->
+    Handler (E e r) es1 m
+cmapHandler v0 f = \case
+    CtlHandler h v -> CtlHandler (h . mapEnv v0 f) v
 
 class EnvFunctors es where
-    cmapHandlers :: (Monad m) => (Env es1 m -> Env es2 m) -> Handlers es es2 m -> Handlers es es1 m
+    cmapHandlers ::
+        (Monad m, EnvFunctors es1, EnvFunctors es2) =>
+        Env es1 m ->
+        (Env es1 m -> Env es2 m) ->
+        Handlers es es2 m ->
+        Handlers es es1 m
 
 instance EnvFunctors '[] where
-    cmapHandlers _ Nil = Nil
+    cmapHandlers _ _ Nil = Nil
 
 instance (EnvFunctor e, EnvFunctors es) => EnvFunctors (E e r : es) where
-    cmapHandlers f (Cons h hs) = Cons (cmapHandler f h) (cmapHandlers f hs)
+    cmapHandlers v0 f (Cons h hs) = Cons (cmapHandler v0 f h) (cmapHandlers v0 f hs)
 
 (!:) :: (EnvFunctor e, EnvFunctors es, Monad m) => Handler (E e r) es m -> Env es m -> Env (E e r : es) m
-h !: Env hs = Env $ Cons (cmapHandler dropEnv h) (cmapHandlers dropEnv hs)
+h !: Env hs = fix \v -> Env $ Cons (cmapHandler v dropEnv h) (cmapHandlers v dropEnv hs)
 
 dropEnv :: (EnvFunctor e, EnvFunctors es, Monad m) => Env (E e r : es) m -> Env es m
-dropEnv (Env (Cons h hs)) = Env $ cmapHandlers (fix \f -> (cmapHandler f h !:)) hs
+dropEnv (Env (Cons h hs)) = fix \r -> Env $ cmapHandlers r (fix \f -> (cmapHandler r f h !:)) hs
 
 raise :: (EnvFunctor e, EnvFunctors es, Monad m) => EffCtlT ps es m a -> EffCtlT ps (E e r : es) m a
 raise = cmapCtlT dropEnv
+
+overrideSubEnv ::
+    (EnvFunctor e, EnvFunctors es1, EnvFunctors es2, Monad m) =>
+    Env es1 m ->
+    Env (E e r : es2) m ->
+    Env (E e r : es1) m
+overrideSubEnv es1 v@(Env (Cons h _)) =
+    fix \v' -> Env $ Cons (cmapHandler v' (const v) h) (cmapHandlers v' dropEnv $ unEnv es1)
+
+data Test1 :: Effect where
+    Test1 :: (EnvFunctor e) => EffCtlT (p : ps) (E e (Ctl p) : es) m a -> Test1 (EffCtlT ps es m) a
+
+instance EnvFunctor Test1 where
+    mapEnv v0 _ (Test1 m) = Test1 $ cmapCtlT (overrideSubEnv v0) m
 
 newtype Membership ff es p = Membership
     { getHandler :: forall w m. Handlers es w m -> Handler (E ff p) w m
