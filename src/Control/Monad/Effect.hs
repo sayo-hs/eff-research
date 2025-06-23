@@ -19,7 +19,7 @@ import Control.Monad.Trans.Reader (ReaderT (ReaderT))
 import Data.Coerce (Coercible, coerce)
 import Data.Data (Proxy (Proxy), (:~:) (Refl))
 import Data.FTCQueue
-import Data.Function ((&))
+import Data.Function (fix, (&))
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
@@ -28,6 +28,8 @@ import UnliftIO (MonadIO, MonadUnliftIO)
 -- | An effect monad built on top of a multi-prompt/control monad.
 newtype EffT es m a = EffT {unEffT :: CtlEnvT (PromptFrames es) es m a}
     deriving newtype (Functor, Applicative, Monad)
+
+type EffT_ es m = CtlEnvT (PromptFrames es) es m
 
 type CtlReaderT ps r m = CtlT ps (ReaderT r m)
 
@@ -149,6 +151,30 @@ instance {-# OVERLAPPABLE #-} (Elem ff es p) => Elem ff (E ff' p' : es) p where
             { getHandler = \(Cons _ hs) -> getHandler membership hs
             , updateHandler = \h (Cons h' hs) -> Cons h' $ updateHandler membership h hs
             }
+
+interpretCtl ::
+    (Monad m, EnvFunctor e, EnvFunctors es) =>
+    (forall p x. p :~: Prompt a (PromptFrames es) -> e (CtlEnvT (p : PromptFrames es) es m) x -> CtlEnvT (p : PromptFrames es) es m x) ->
+    (forall p. p :~: Prompt a (PromptFrames es) -> EffT (E e (Ctl p) : es) m a) ->
+    EffT es m a
+interpretCtl h m =
+    EffT $ prompt \Refl -> mapCtlReaderT dropEnv (CtlHandler (h Refl) !:) $ unEffT (m Refl)
+
+interpretBy ::
+    (Monad m, EnvFunctor e, EnvFunctors es) =>
+    (a -> EffT es m b) ->
+    (forall p x. p :~: Prompt b (PromptFrames es) -> e (CtlEnvT (p : PromptFrames es) es m) x -> (x -> EffT es m b) -> EffT es m b) ->
+    (forall p. p :~: Prompt b (PromptFrames es) -> EffT (E e (Ctl p) : es) m a) ->
+    EffT es m b
+interpretBy ret hdl m =
+    interpretCtl
+        (\p e -> control p \k -> unEffT $ hdl p e (EffT . k))
+        \p -> do
+            x <- m p
+            raise $ ret x
+
+raise :: (Monad m) => EffT es m a -> EffT (E e (Ctl p) : es) m a
+raise (EffT m) = EffT $ raiseCtlT $ mapCtlReaderT undefined undefined m
 
 {-
 interpretCtl ::

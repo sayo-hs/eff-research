@@ -151,6 +151,9 @@ control p@Refl f = CtlT . pure . Ctl . inject p $ PrimOp $ Control f (tsingleton
 abort :: forall p ans u ps m a. (Member p ps, Monad m) => p :~: Prompt ans u -> ans -> CtlT ps m a
 abort p ans = control p \_ -> pure ans
 
+raiseCtlT :: (Monad m) => CtlT ps m a -> CtlT (p : ps) m a
+raiseCtlT = undefined
+
 under :: (Member p ps, Monad m) => p :~: Prompt ans u -> CtlT u m a -> CtlT ps m a
 under p@Refl (CtlT m) =
     CtlT $
