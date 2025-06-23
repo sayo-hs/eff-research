@@ -73,6 +73,13 @@ type data PromptFrame = Prompt Type Type [PromptFrame]
 -}
 newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: r -> m (CtlResult ps r m a)}
 
+cmapCtlT :: (Monad m) => (r1 -> r2) -> CtlT ps r2 m a -> CtlT ps r1 m a
+cmapCtlT f (CtlT m) = CtlT \r ->
+    m (f r) <&> \case
+        Pure x -> Pure x
+        Ctl ctls -> Ctl $ forCtls ctls \case
+            Control ctl q -> Control ctl (tsingleton $ cmapCtlT f . qApp q)
+
 data CtlResult ps r m a
     = Pure a
     | Ctl (Ctls ps r m a)
