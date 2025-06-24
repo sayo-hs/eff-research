@@ -28,6 +28,11 @@ import UnliftIO (MonadIO, MonadUnliftIO)
 -- | An effect monad built on top of a multi-prompt/control monad.
 newtype EffT es m a = EffT {unEffT :: EffCtlT (PromptFrames es) es m a}
 
+type family e !: m where
+    e !: EffT es m = EffT (e : es) m
+    E e (Ctl p) !: EffCtlT ps es m = EffCtlT (p : ps) (E e (Ctl p) : es) m
+    E e (Tail u) !: EffCtlT ps es m = EffCtlT ps (E e (Tail u) : es) m
+
 deriving instance (Applicative f) => Functor (EffT es f)
 
 instance (Monad m) => Applicative (EffT es m) where
@@ -74,6 +79,8 @@ class EnvFunctor e where
         e (EffCtlT u es1 m) a ->
         e (EffCtlT u es2 m) a
 
+    fromCtl :: e (EffCtlT (PromptFrames es) es m) a -> e (EffT es m) a
+
 cmapHandler ::
     (EnvFunctor e, Monad m, EnvFunctors es1, EnvFunctors es2) =>
     Env es1 m ->
@@ -115,10 +122,11 @@ overrideSubEnv es1 v@(Env (Cons h _)) =
     fix \v' -> Env $ Cons (cmapHandler v' (const v) h) (cmapHandlers v' dropEnv $ unEnv es1)
 
 data Test1 :: Effect where
-    Test1 :: (EnvFunctor e) => EffCtlT (p : ps) (E e (Ctl p) : es) m a -> Test1 (EffCtlT ps es m) a
+    Test1 :: (EnvFunctor e) => (E e (Ctl p) !: m) a -> Test1 m a
 
 instance EnvFunctor Test1 where
     mapEnv v0 _ (Test1 m) = Test1 $ cmapCtlT (overrideSubEnv v0) m
+    fromCtl (Test1 m) = Test1 $ EffT m
 
 newtype Membership ff es p = Membership
     { getHandler :: forall w m. Handlers es w m -> Handler (E ff p) w m
@@ -158,15 +166,23 @@ interpretCtl ::
 interpretCtl h m =
     prompt (\r -> CtlHandler (h Proxy) r !: r) \p -> m p
 
+interpretCtl' ::
+    (Monad m, EnvFunctor e, EnvFunctors es) =>
+    (forall p x. (p ~ Prompt a (Env es m) ps) => Proxy p -> e (EffCtlT (p : ps) (E e (Ctl p) : es) m) x -> EffCtlT (p : ps) es m x) ->
+    (forall p. (p ~ Prompt a (Env es m) ps) => Proxy p -> EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
+    EffCtlT ps es m a
+interpretCtl' h m =
+    prompt (fix \f r -> CtlHandler (h Proxy . mapEnv r f) r !: r) \p -> m p
+
 interpretBy ::
     (Monad m, EnvFunctor e, EnvFunctors es) =>
     (forall p. a -> EffT (E e (Ctl p) : es) m b) ->
-    (forall p ps x. e (EffCtlT (p : ps) es m) x -> (x -> EffCtlT ps es m b) -> EffT es m b) ->
+    (forall p x. e (EffT (E e (Ctl p) : es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
     (forall p. EffT (E e (Ctl p) : es) m a) ->
     EffT es m b
 interpretBy ret hdl m =
-    EffT $ interpretCtl
-        (\p e -> control p \k -> unEffT $ hdl e k)
+    EffT $ interpretCtl'
+        (\p e -> control p \k -> unEffT $ hdl (fromCtl e) (EffT . k))
         \_ -> do
             x <- unEffT m
             unEffT $ ret x
