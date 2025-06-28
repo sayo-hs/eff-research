@@ -16,15 +16,10 @@ module Control.Monad.Effect where
 
 import Control.Monad.MultiPrompt.Formal
 import Control.Monad.MultiPrompt.Formal qualified as C
-import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.Coerce (Coercible, coerce)
-import Data.Data (Proxy (Proxy), (:~:) (Refl))
-import Data.FTCQueue
-import Data.Function (fix, (&))
-import Data.Functor ((<&>))
+import Data.Data (Proxy (Proxy))
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
-import UnliftIO (MonadIO, MonadUnliftIO)
 
 -- | An effect monad built on top of a multi-prompt/control monad.
 newtype EffT es m a = EffT {unEffT :: EffCtlT (PromptFrames es) es m a}
