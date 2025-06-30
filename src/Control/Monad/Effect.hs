@@ -2,187 +2,220 @@
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE QuantifiedConstraints #-}
-{-# LANGUAGE TypeAbstractions #-}
 {-# LANGUAGE TypeData #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# HLINT ignore "Avoid lambda" #-}
-{-# OPTIONS_GHC -Wno-redundant-constraints #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 -- SPDX-License-Identifier: MPL-2.0
 
 module Control.Monad.Effect where
 
-import Control.Monad.MultiPrompt.Formal
+import Control.Monad.MultiPrompt.Formal (
+    CtlResult (Pure),
+    CtlT (..),
+    Member,
+    PromptFrame (..),
+    cmapCtlT,
+    runCtlT,
+    under,
+ )
 import Control.Monad.MultiPrompt.Formal qualified as C
 import Data.Coerce (Coercible, coerce)
 import Data.Data (Proxy (Proxy))
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
 
--- | An effect monad built on top of a multi-prompt/control monad.
-newtype EffT es m a = EffT {unEffT :: EffCtlT (PromptFrames es) es m a}
-
-type family e !: m where
-    e !: EffT es m = EffT (e : es) m
-    E e (Ctl p) !: EffCtlT ps es m = EffCtlT (p : ps) (E e (Ctl p) : es) m
-    E e (Tail u) !: EffCtlT ps es m = EffCtlT ps (E e (Tail u) : es) m
-
-deriving instance (Applicative f) => Functor (EffT es f)
-
-instance (Monad m) => Applicative (EffT es m) where
-    pure x = EffT $ pure x
-    EffT ff <*> EffT fm = EffT $ ff <*> fm
-
-instance (Monad m) => Monad (EffT es m) where
-    EffT m >>= f = EffT $ m >>= \x -> unEffT $ f x
-
-type EffCtlT ps es m = CtlT ps (Env es m) m
-
 type Effect = (Type -> Type) -> Type -> Type
-type data EffectFrame = E Effect Resumption
-type data Resumption = Tail [PromptFrame] | Ctl PromptFrame
 
-type family PromptFrames es where
-    PromptFrames (E _ (Ctl p) : es) = p : PromptFrames es
-    PromptFrames (E _ (Tail _) : es) = PromptFrames es
-    PromptFrames '[] = '[]
+infixr 6 :+
+infixr 6 :/
+
+type data Frames = Type :/ Frames | Effect :+ Frames | Nil
+
+type data Frame = E Effect | P Type
+
+type family ConsFrame e = r | r -> e where
+    ConsFrame (E e) = (:+) e
+    ConsFrame (P ans) = (:/) ans
+
+type family Prompts m es where
+    Prompts m (ans :/ es) = Prompt ans (Env m (ans :/ es)) : Prompts m (BasePrompt es)
+    Prompts _ Nil = '[]
+
+type family Effects es where
+    Effects (e :+ es) = e : Effects es
+    Effects (_ :/ es) = Effects es
+    Effects Nil = '[]
+
+type family FrameList es where
+    FrameList (e :+ es) = E e : FrameList es
+    FrameList (ans :/ es) = P ans : FrameList es
+    FrameList Nil = '[]
+
+type family BasePrompt es where
+    BasePrompt (_ :+ es) = BasePrompt es
+    BasePrompt (ans :/ es) = ans :/ es
+    BasePrompt Nil = Nil
+
+class (u :: [PromptFrame]) < (es :: Frames) where
+    type Underlying u es :: Frames
+    raiseUnderlying :: (Monad m) => EffT (Underlying u es) m a -> EffT es m a
+
+newtype Env m es = Env {unEnv :: Handlers m es es}
+
+mapEnv ::
+    (Monad m, EnvFunctors es1, EnvFunctors es2) =>
+    (forall w. Handlers m w es1 -> Handlers m w es2) ->
+    Env m es1 ->
+    Env m es2
+mapEnv f (Env hs) = Env $ mapHandlers (mapEnv f) $ f hs
 
 -- | A effect handler.
-data Handler e w m where
-    CtlHandler ::
-        ( forall x.
-          e (EffCtlT (Prompt ans (Env es m) u : u) w m) x ->
-          EffCtlT (Prompt ans (Env es m) u : u) es m x
-        ) ->
-        Env es m ->
-        Handler (E e (Ctl (Prompt ans (Env es m) u))) w m
+data Handler (m :: Type -> Type) (w :: Frames) (e :: Effect) (u :: Frames) where
+    Handler :: (forall x. e (EffCtlT (Prompts m u) w m) x -> EffCtlT (Prompts m u) u m x) -> Env m u -> Handler m w e u
 
 -- | Vector of handlers.
-data Handlers (es :: [EffectFrame]) (w :: [EffectFrame]) m where
-    Cons :: Handler e w m -> Handlers es w m -> Handlers (e : es) w m
-    Nil :: Handlers '[] w m
+data Handlers (m :: Type -> Type) (w :: Frames) (es :: Frames) where
+    ConsHandler :: Handler m w e (BasePrompt es) -> Handlers m w es -> Handlers m w (e :+ es)
+    ConsPrompt :: Handlers m w es -> Handlers m w (ans :/ es)
+    Nil :: Handlers w m Nil
 
-newtype Env es m = Env {unEnv :: Handlers es es m}
+-- | An effect monad built on top of a multi-prompt/control monad.
+newtype EffT es m a = EffT {unEffT :: CtlT (Prompts m (BasePrompt es)) (Env m es) m a}
+    deriving (Functor, Applicative, Monad)
+
+newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Env m es) m a}
+    deriving (Functor, Applicative, Monad)
+
+class EnvFunctors es where
+    mapHandlers ::
+        (Monad m, EnvFunctors es1, EnvFunctors es2) =>
+        (Env m es1 -> Env m es2) ->
+        Handlers m es1 es ->
+        Handlers m es2 es
+
+instance EnvFunctors Nil where
+    mapHandlers _ Nil = Nil
+
+instance (EnvFunctor e, EnvFunctors es) => EnvFunctors (e :+ es) where
+    mapHandlers f (ConsHandler h hs) = ConsHandler (mapHandler f h) (mapHandlers f hs)
+
+instance (EnvFunctors es) => EnvFunctors (ans :/ es) where
+    mapHandlers f (ConsPrompt hs) = ConsPrompt (mapHandlers f hs)
 
 -- | A type-class for higher-order effects.
 class EnvFunctor e where
     cmapEnv ::
         (Monad m, EnvFunctors es1, EnvFunctors es2) =>
-        (Env es1 m -> Env es2 m) ->
+        (Env m es1 -> Env m es2) ->
         e (EffCtlT u es2 m) a ->
         e (EffCtlT u es1 m) a
 
-    fromCtl :: e (EffCtlT (PromptFrames es) es m) a -> e (EffT es m) a
+    fromCtl :: e (EffCtlT (Prompts m (BasePrompt es)) es m) a -> e (EffT es m) a
 
 mapHandler ::
     (EnvFunctor e, Monad m, EnvFunctors es1, EnvFunctors es2) =>
-    (Env es1 m -> Env es2 m) ->
-    Handler (E e r) es1 m ->
-    Handler (E e r) es2 m
+    (Env m es1 -> Env m es2) ->
+    Handler m es1 e u ->
+    Handler m es2 e u
 mapHandler f = \case
-    CtlHandler h v -> CtlHandler (h . cmapEnv f) v
+    Handler h v -> Handler (h . cmapEnv f) v
 
-class EnvFunctors es where
-    mapHandlers ::
-        (Monad m, EnvFunctors es1, EnvFunctors es2) =>
-        (Env es1 m -> Env es2 m) ->
-        Handlers es es1 m ->
-        Handlers es es2 m
+(!:) :: (EnvFunctor e, EnvFunctors es, Monad m) => Handler m es e (BasePrompt es) -> Env m es -> Env m (ConsFrame (E e) es)
+h@(Handler _ _) !: Env hs = Env $ ConsHandler (mapHandler (h !:) h) (mapHandlers (h !:) hs)
 
-instance EnvFunctors '[] where
-    mapHandlers _ Nil = Nil
+class IsFrame e where
+    dropEnv :: (EnvFunctors es, Monad m) => Env m (ConsFrame e es) -> Env m es
 
-instance (EnvFunctor e, EnvFunctors es) => EnvFunctors (E e r : es) where
-    mapHandlers f (Cons h hs) = Cons (mapHandler f h) (mapHandlers f hs)
+instance (EnvFunctor e) => IsFrame (E e) where
+    dropEnv (Env (ConsHandler _ hs)) = Env $ mapHandlers dropEnv hs
 
-(!:) :: (EnvFunctor e, EnvFunctors es, Monad m) => Handler (E e r) es m -> Env es m -> Env (E e r : es) m
-h !: Env hs = Env $ Cons (mapHandler (h !:) h) (mapHandlers (h !:) hs)
+instance IsFrame (P ans) where
+    dropEnv (Env (ConsPrompt hs)) = Env $ mapHandlers dropEnv hs
 
-dropEnv :: (EnvFunctor e, EnvFunctors es, Monad m) => Env (E e r : es) m -> Env es m
-dropEnv (Env (Cons _ hs)) = Env $ mapHandlers dropEnv hs
-
-raise :: (EnvFunctor e, EnvFunctors es, Monad m) => EffCtlT ps es m a -> EffCtlT ps (E e r : es) m a
-raise = cmapCtlT dropEnv
-
-newtype Membership ff es p = Membership
-    { getHandler :: forall w m. Handlers es w m -> Handler (E ff p) w m
+newtype Membership e es u = Membership
+    { getHandler :: forall w m. Handlers m w es -> Handler m w e u
     }
 
 -- | Type-level search over elements in a vector.
-class Elem ff (es :: [EffectFrame]) p | ff es -> p where
-    membership :: Membership ff es p
+class Elem e (es :: Frames) u | e es -> u where
+    membership :: Membership e es u
 
-instance Elem ff (E ff p : es) p where
+instance (u ~ BasePrompt es) => Elem e (e :+ es) u where
     membership =
         Membership
-            { getHandler = \(Cons h _) -> h
+            { getHandler = \(ConsHandler h _) -> h
             }
 
-instance {-# OVERLAPPABLE #-} (Elem ff es p) => Elem ff (E ff' p' : es) p where
+instance {-# OVERLAPPABLE #-} (Elem e es u) => Elem e (e' :+ es) u where
     membership =
         Membership
-            { getHandler = \(Cons _ hs) -> getHandler membership hs
+            { getHandler = \(ConsHandler _ hs) -> getHandler membership hs
             }
 
-sendCtl ::
-    (Member (Prompt ans r u) ps, Monad m, EnvFunctor e, p ~ Prompt ans r u) =>
-    Proxy p ->
-    Membership e es (Ctl p) ->
-    e (EffCtlT (p : u) es m) a ->
-    EffCtlT ps es m a
-sendCtl p i e = CtlT \r@(Env hs) -> case getHandler i hs of
-    CtlHandler h r' ->
-        unCtlT (under p (\(Env hs') -> case getHandler i hs' of CtlHandler _ r'' -> r'') r' $ h e) r
+instance (Elem e es u) => Elem e (ans :/ es) u where
+    membership =
+        Membership
+            { getHandler = \(ConsPrompt hs) -> getHandler membership hs
+            }
 
-interpretCtl ::
-    (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall p x. (p ~ Prompt a (Env es m) ps) => Proxy p -> e (EffCtlT (p : ps) es m) x -> EffCtlT (p : ps) es m x) ->
-    (forall p. (p ~ Prompt a (Env es m) ps) => Proxy p -> EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
-    EffCtlT ps es m a
-interpretCtl h m =
-    prompt (\r -> CtlHandler (h Proxy) r !: r) \p -> m p
+send ::
+    forall e es u m a ans.
+    (Member (Prompts m (BasePrompt u)) (Prompts m (BasePrompt es)) (Prompt ans (Env m (ans :/ u))), Monad m) =>
+    Membership e es (ans :/ u) ->
+    e (EffCtlT (Prompt ans (Env m (ans :/ u)) : Prompts m (BasePrompt u)) es m) a ->
+    EffT es m a
+send i e = EffT $ CtlT \r@(Env hs) -> case getHandler i hs of
+    Handler h r' -> unCtlT (under Proxy (\(Env hs') -> case getHandler i hs' of Handler _ r'' -> r'') r' $ unEffCtlT $ h e) r
 
-interpretBy ::
-    (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall p. (p ~ Prompt b (Env es m) ps) => a -> EffCtlT (p : ps) (E e (Ctl p) : es) m b) ->
-    (forall p x. (p ~ Prompt b (Env es m) ps) => e (EffCtlT (p : ps) es m) x -> (x -> EffCtlT ps es m b) -> EffCtlT ps es m b) ->
-    (forall p. (p ~ Prompt b (Env es m) ps) => EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
-    EffCtlT ps es m b
-interpretBy ret hdl m =
-    interpretCtl
-        (\p e -> control p \k -> hdl e k)
-        \_ -> do
-            x <- m
-            ret x
+sendTail :: forall e es m a. (Functor m) => Membership e es Nil -> e (EffCtlT '[] es m) a -> EffT es m a
+sendTail i e = EffT $ CtlT \(Env hs) -> case getHandler i hs of
+    Handler h _ -> Pure <$> runCtlT (Env Nil) (unEffCtlT $ h e)
 
-interpretCtl' ::
-    (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall p x. (p ~ Prompt a (Env es m) ps) => Proxy p -> e (EffCtlT (p : ps) (E e (Ctl p) : es) m) x -> EffCtlT (p : ps) es m x) ->
-    (forall p. (p ~ Prompt a (Env es m) ps) => Proxy p -> EffCtlT (p : ps) (E e (Ctl p) : es) m a) ->
-    EffCtlT ps es m a
-interpretCtl' h m =
-    prompt (\r -> CtlHandler (h Proxy . cmapEnv dropEnv) r !: r) \p -> m p
+class (EnvFunctors es) => Base es where
+    dropToBasePrompt :: (Monad m) => Env m es -> Env m (BasePrompt es)
+    supplyBaseHandlers :: (Monad m) => Handlers m w es -> Handlers m w (BasePrompt es) -> Handlers m w es
 
-interpretBy' ::
-    (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall p. a -> EffT (E e (Ctl p) : es) m b) ->
-    (forall p x. e (EffT (E e (Ctl p) : es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
-    (forall p. EffT (E e (Ctl p) : es) m a) ->
-    EffT es m b
-interpretBy' ret hdl m =
-    EffT $ interpretCtl'
-        (\p e -> control p \k -> unEffT $ hdl (fromCtl e) (EffT . k))
-        \_ -> do
-            x <- unEffT m
-            unEffT $ ret x
+instance (Base es, EnvFunctor e) => Base (e :+ es) where
+    dropToBasePrompt = dropToBasePrompt . dropEnv
+    supplyBaseHandlers (ConsHandler h hs) hs' = ConsHandler h $ supplyBaseHandlers hs hs'
 
-runPure :: EffCtlT '[] '[] Identity a -> a
-runPure = C.runPure (Env Nil)
+instance (EnvFunctors es) => Base (ans :/ es) where
+    dropToBasePrompt = id
+    supplyBaseHandlers _ = id
 
-runEffT :: (Functor f) => EffCtlT '[] '[] f a -> f a
-runEffT = runCtlT (Env Nil)
+instance Base Nil where
+    dropToBasePrompt = id
+    supplyBaseHandlers _ = id
+
+supplyBase :: (Base es, Monad m, EnvFunctors (BasePrompt es)) => Env m es -> Env m (BasePrompt es) -> Env m es
+supplyBase (Env v) (Env v') = Env $ supplyBaseHandlers v (mapHandlers (supplyBase (Env v)) v')
+
+interpret ::
+    ( Monad m
+    , EnvFunctor e
+    , EnvFunctors (BasePrompt es)
+    , Base es
+    ) =>
+    (forall x. e (EffT es m) x -> EffT es m x) ->
+    EffT (e :+ es) m a ->
+    EffT es m a
+interpret f (EffT m) =
+    EffT $
+        cmapCtlT
+            (\r -> Handler (EffCtlT . cmapCtlT (supplyBase r) . unEffT . f . fromCtl) (dropToBasePrompt r) !: r)
+            m
+
+prompt :: (Monad m, EnvFunctors es) => EffT (a :/ es) m a -> EffT es m a
+prompt (EffT m) = EffT $ cmapCtlT (mapEnv ConsPrompt) $ C.prompt id $ const m
+
+runPure :: EffT Nil Identity a -> a
+runPure = C.runPure (Env Nil) . unEffT
+
+runEffT :: (Functor f) => EffT Nil f a -> f a
+runEffT = runCtlT (Env Nil) . unEffT
 
 newtype FirstOrder (e :: Effect) f a = FirstOrder (e f a)
 
@@ -199,5 +232,5 @@ data Catch e :: Effect where
 deriving via FirstOrder (Throw e) instance EnvFunctor (Throw e)
 
 instance EnvFunctor (Catch e) where
-    cmapEnv f (Catch m k) = Catch (cmapCtlT f m) (cmapCtlT f . k)
+    cmapEnv f (Catch m k) = Catch (EffCtlT $ cmapCtlT f $ unEffCtlT m) (EffCtlT . cmapCtlT f . unEffCtlT . k)
     fromCtl = coerce
