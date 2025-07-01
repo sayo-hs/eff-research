@@ -13,15 +13,17 @@
 module Control.Monad.Effect where
 
 import Control.Monad.MultiPrompt.Formal (
-    CtlResult (Pure),
     CtlT (..),
-    Member,
+    FreerF (Pure),
+    FreerT (FreerT),
     PromptFrame (..),
     cmapCtlT,
     runCtlT,
+    runFreerT,
     under,
  )
 import Control.Monad.MultiPrompt.Formal qualified as C
+import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.Coerce (Coercible, coerce)
 import Data.Data (Proxy (Proxy))
 import Data.Functor.Identity (Identity)
@@ -162,17 +164,25 @@ instance (Elem e es u) => Elem e (ans :/ es) u where
             }
 
 send ::
-    forall e es u m a ans.
-    (Member (Prompts m (BasePrompt u)) (Prompts m (BasePrompt es)) (Prompt ans (Env m (ans :/ u))), Monad m) =>
-    Membership e es (ans :/ u) ->
-    e (EffCtlT (Prompt ans (Env m (ans :/ u)) : Prompts m (BasePrompt u)) es m) a ->
+    forall e es u m a.
+    (Prompts m u C.< Prompts m (BasePrompt es), Monad m) =>
+    Membership e es u ->
+    e (EffCtlT (Prompts m u) es m) a ->
     EffT es m a
-send i e = EffT $ CtlT \r@(Env hs) -> case getHandler i hs of
-    Handler h r' -> unCtlT (under Proxy (\(Env hs') -> case getHandler i hs' of Handler _ r'' -> r'') r' $ unEffCtlT $ h e) r
+send i e =
+    EffT $ CtlT $ FreerT $ ReaderT \r@(Env hs) ->
+        let Handler h r' = getHandler i hs
+         in (`runReaderT` r)
+                . runFreerT
+                . unCtlT
+                . under Proxy (\(Env hs') -> let Handler _ r'' = getHandler i hs' in r'') r'
+                . unEffCtlT
+                $ h e
 
 sendTail :: forall e es m a. (Functor m) => Membership e es Nil -> e (EffCtlT '[] es m) a -> EffT es m a
-sendTail i e = EffT $ CtlT \(Env hs) -> case getHandler i hs of
-    Handler h _ -> Pure <$> runCtlT (Env Nil) (unEffCtlT $ h e)
+sendTail i e = EffT $ CtlT $ FreerT $ ReaderT \(Env hs) ->
+    let Handler h _ = getHandler i hs
+     in Pure <$> runCtlT (Env Nil) (unEffCtlT $ h e)
 
 class (EnvFunctors es) => Base es where
     dropToBasePrompt :: (Monad m) => Env m es -> Env m (BasePrompt es)
