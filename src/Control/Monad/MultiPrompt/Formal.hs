@@ -34,30 +34,30 @@ import UnliftIO (MonadIO, MonadUnliftIO (withRunInIO), liftIO)
     list of prompt stack frames becomes recursive and its size explodes exponentially, so this
     approach prevents that.
 -}
-data StackUnion (xs :: [k]) (h :: k -> [k] -> Type) where
-    Here :: h x xs -> StackUnion (x : xs) h
-    There :: StackUnion xs h -> StackUnion (x : xs) h
+data StackUnion (xs :: [k]) (h :: k -> [k] -> l -> Type) (a :: l) where
+    Here :: h x xs a -> StackUnion (x : xs) h a
+    There :: StackUnion xs h a -> StackUnion (x : xs) h a
 
-mapStackUnion :: (forall x r. h x r -> i x r) -> StackUnion xs h -> StackUnion xs i
+mapStackUnion :: (forall x r. h x r a -> i x r a) -> StackUnion xs h a -> StackUnion xs i a
 mapStackUnion f = \case
     Here x -> Here $ f x
     There xs -> There $ mapStackUnion f xs
 
-forStackUnion :: StackUnion xs h -> (forall x r. h x r -> i x r) -> StackUnion xs i
+forStackUnion :: StackUnion xs h a -> (forall x r. h x r a -> i x r a) -> StackUnion xs i a
 forStackUnion u f = mapStackUnion f u
 
 class Member r xs x | r xs -> x where
-    inj :: h x r -> StackUnion xs h
-    prj :: StackUnion xs h -> Maybe (h x r)
-    emb :: StackUnion r h -> StackUnion xs h
+    inj :: h x r a -> StackUnion xs h a
+    prj :: StackUnion xs h a -> Maybe (h x r a)
+    emb :: StackUnion r h a -> StackUnion xs h a
 
-inject :: (Member r xs x) => Proxy r -> h x r -> StackUnion xs h
+inject :: (Member r xs x) => Proxy r -> h x r a -> StackUnion xs h a
 inject _ = inj
 
-project :: (Member r xs x) => Proxy r -> StackUnion xs h -> Maybe (h x r)
+project :: (Member r xs x) => Proxy r -> StackUnion xs h a -> Maybe (h x r a)
 project _ = prj
 
-embed :: (Member r xs x) => Proxy r -> StackUnion r h -> StackUnion xs h
+embed :: (Member r xs x) => Proxy r -> StackUnion r h a -> StackUnion xs h a
 embed _ = emb
 
 instance Member xs (x : xs) x where
@@ -76,6 +76,63 @@ instance {-# OVERLAPPABLE #-} (Member r xs x) => Member r (x' : xs) x where
 
 type data PromptFrame = Prompt Type Type
 
+-- | The base functor for a freer monad.
+data FreerF f g a
+    = Pure a
+    | forall x. Freer (f x) (FTCQueue g x a)
+
+-- | The freer monad transformer for a type constructor @f@
+newtype FreerT f m a = FreerT {runFreerT :: m (FreerF f (FreerT f m) a)}
+
+instance (Applicative g) => Functor (FreerT f g) where
+    fmap f (FreerT m) =
+        FreerT $
+            m <&> \case
+                Pure x -> Pure $ f x
+                Freer g q -> Freer g $ q |> (FreerT . pure . Pure . f)
+
+instance (Monad m) => Applicative (FreerT f m) where
+    pure = FreerT . pure . Pure
+    (<*>) = ap
+
+instance (Monad m) => Monad (FreerT f m) where
+    FreerT m >>= f =
+        FreerT $
+            m >>= \case
+                Pure x -> runFreerT $ f x
+                Freer g k -> pure $ Freer g $ k |> f
+
+instance (MonadIO m) => MonadIO (FreerT f m) where
+    liftIO m = FreerT $ liftIO $ Pure <$> m
+
+liftF :: (Applicative g) => f a -> FreerT f g a
+liftF f = FreerT $ pure $ Freer f (tsingleton $ FreerT . pure . Pure)
+
+transFreerT :: (Monad m) => (forall x. f x -> g x) -> FreerT f m a -> FreerT g m a
+transFreerT phi (FreerT m) =
+    FreerT $
+        m <&> \case
+            Pure x -> Pure x
+            Freer f q -> Freer (phi f) (tsingleton $ transFreerT phi . qApp q)
+
+hoistFreerT :: (Monad m) => (forall x. m x -> n x) -> FreerT f m a -> FreerT f n a
+hoistFreerT phi (FreerT m) =
+    FreerT . phi $
+        m <&> \case
+            Pure x -> Pure x
+            Freer f q -> Freer f (tsingleton $ hoistFreerT phi . qApp q)
+
+qApp :: (Monad m) => FTCQueue (FreerT f m) a b -> a -> FreerT f m b
+qApp q x = FreerT case tviewl q of
+    TOne k -> runFreerT $ k x
+    k :| t ->
+        runFreerT (k x) >>= \case
+            Pure y -> runFreerT $ qApp t y
+            Freer f q' -> pure $ Freer f $ q' >< t
+
+liftFreerT :: (Functor g) => g a -> FreerT f g a
+liftFreerT a = FreerT $ Pure <$> a
+
 {- | A type-safe multi-prompt/control monad transformer with reader environment.
 
     @ps@: A list of the current prompt stack frames.
@@ -84,50 +141,28 @@ type data PromptFrame = Prompt Type Type
 
     @m@: The base monad.
 -}
-newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: r -> m (CtlResult ps r m a)}
+newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: FreerT (StackUnion ps (Control m)) (ReaderT r m) a}
+    deriving (Functor, Applicative, Monad, MonadIO)
 
-cmapCtlT :: (Monad m) => (r1 -> r2) -> CtlT ps r2 m a -> CtlT ps r1 m a
-cmapCtlT f (CtlT m) = CtlT \r ->
-    m (f r) <&> \case
-        Pure x -> Pure x
-        Ctl ctls -> Ctl $ forStackUnion ctls \case
-            Control ctl q -> Control ctl (tsingleton $ cmapCtlT f . qApp q)
+data Control (m :: Type -> Type) (p :: PromptFrame) (u :: [PromptFrame]) (a :: Type) where
+    Control :: ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> Control m (Prompt ans r') u a
 
-data CtlResult ps r m a
-    = Pure a
-    | Ctl (Ctls ps r m a)
+cmapCtlT :: (Monad m) => (r -> r') -> CtlT ps r' m a -> CtlT ps r m a
+cmapCtlT f = CtlT . hoistFreerT (ReaderT . (. f) . runReaderT) . unCtlT
 
-type Ctls ps r m a = StackUnion ps (CtlFrame ps r m a)
+runCtlT :: (Functor f) => r -> CtlT '[] r f a -> f a
+runCtlT r (CtlT (FreerT m)) =
+    runReaderT m r <&> \case
+        Pure x -> x
+        Freer f _ -> case f of {}
 
-data CtlFrame (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) (u :: [PromptFrame]) where
-    Control :: ((b -> CtlT u r' m ans) -> CtlT u r' m ans) -> FTCQueue (CtlT ps r m) b a -> CtlFrame ps r m a (Prompt ans r') u
-
-instance (Applicative f) => Functor (CtlResult ps r f) where
-    fmap f = \case
-        Pure x -> Pure $ f x
-        Ctl ctls -> Ctl $ forStackUnion ctls \case
-            Control ctl q -> Control ctl $ q |> (CtlT . const . pure . Pure . f)
-
-instance (Applicative f) => Functor (CtlT ps r f) where
-    fmap f (CtlT m) = CtlT $ fmap (fmap f) . m
-
-instance (Monad m) => Applicative (CtlT ps r m) where
-    pure = CtlT . const . pure . Pure
-    (<*>) = ap
-
-instance (Monad m) => Monad (CtlT ps r m) where
-    CtlT m >>= f =
-        CtlT \r ->
-            m r >>= \case
-                Pure x -> unCtlT (f x) r
-                Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
-                    Control ctl q -> Control ctl $ q |> f
-
-instance (MonadIO m) => MonadIO (CtlT ps r m) where
-    liftIO m = CtlT \_ -> liftIO $ Pure <$> m
+runPure :: r -> CtlT '[] r Identity a -> a
+runPure r (CtlT (FreerT (ReaderT m))) = case runIdentity (m r) of
+    Pure x -> x
+    Freer u _ -> case u of {}
 
 instance (MonadUnliftIO m) => MonadUnliftIO (CtlT '[] r m) where
-    withRunInIO f = CtlT \r -> withRunInIO \run -> Pure <$> f (run . runCtlT r)
+    withRunInIO f = CtlT $ FreerT $ withRunInIO \run -> Pure <$> f (run . ReaderT . flip runCtlT)
 
 class Unlift b m where
     withRunInBase :: ((forall x. m x -> b x) -> b a) -> m a
@@ -136,7 +171,7 @@ instance (Unlift b f) => Unlift b (ReaderT r f) where
     withRunInBase f = ReaderT \r -> withRunInBase \run -> f $ run . flip runReaderT r
 
 instance (Unlift b f, Functor f) => Unlift b (CtlT '[] r f) where
-    withRunInBase f = CtlT \r -> Pure <$> withRunInBase \run -> f (run . runCtlT r)
+    withRunInBase f = CtlT $ FreerT $ ReaderT \r -> Pure <$> withRunInBase \run -> f (run . runCtlT r)
 
 prompt ::
     forall r r' ps m ans.
@@ -145,59 +180,42 @@ prompt ::
     (Proxy ps -> CtlT (Prompt ans r' : ps) r m ans) ->
     CtlT ps r' m ans
 prompt f m =
-    CtlT \r ->
-        unCtlT (m Proxy) (f r) >>= \case
+    CtlT $ FreerT $ ReaderT \r ->
+        runReaderT (runFreerT $ unCtlT $ m Proxy) (f r) >>= \case
             Pure x -> pure $ Pure x
-            Ctl ctls -> case ctls of
-                Here (Control ctl q) ->
-                    unCtlT (ctl \x -> prompt f \_ -> qApp q x) r
-                There u ->
-                    pure $ Ctl $ forStackUnion u \case
-                        Control ctl q -> Control ctl $ tsingleton \x -> prompt f \_ -> qApp q x
+            Freer ctls q ->
+                let k x = prompt f \_ -> CtlT $ qApp q x
+                 in case ctls of
+                        Here (Control ctl) -> runReaderT (runFreerT $ unCtlT $ ctl k) r
+                        There u -> pure $ Freer u (tsingleton $ unCtlT . k)
 
 control :: (Member u ps (Prompt ans r'), Applicative m) => Proxy u -> ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> CtlT ps r m a
-control p f = CtlT . const . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . const . pure . Pure)
+control p = CtlT . liftF . inject p . Control
 
 abort :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> ans -> CtlT ps r m a
 abort p ans = control p \_ -> pure ans
 
 under :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> (r -> r') -> r' -> CtlT (Prompt ans r' : u) r' m a -> CtlT ps r m a
-under p f r (CtlT m) =
-    CtlT \_ ->
+under p f r (CtlT (FreerT (ReaderT m))) =
+    CtlT $ FreerT $ ReaderT \_ ->
         m r <&> \case
             Pure x -> Pure x
-            Ctl ctls -> Ctl $ case ctls of
-                Here (Control ctl q) ->
-                    inject p $ Control ctl (tsingleton $ under p f r . qApp q)
-                There u ->
-                    embed p $ forStackUnion u \case
-                        Control ctl q -> Control ctl (tsingleton $ underk p f $ qApp q)
+            Freer ctls q ->
+                let k = tsingleton $ unCtlT . underk p f (CtlT . qApp q)
+                 in (`Freer` k) case ctls of
+                        Here (Control ctl) -> inject p $ Control ctl
+                        There u -> embed p u
 
-underk :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> (r -> r') -> (b -> CtlT (Prompt ans r' : u) r' m a) -> (b -> CtlT ps r m a)
-underk p f k x = CtlT \r -> unCtlT (under p f (f r) $ k x) r
-
-qApp :: (Monad m) => FTCQueue (CtlT ps r m) a b -> a -> CtlT ps r m b
-qApp q x = CtlT \r -> case tviewl q of
-    TOne k -> unCtlT (k x) r
-    k :| t ->
-        unCtlT (k x) r >>= \case
-            Pure y -> unCtlT (qApp t y) r
-            Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
-                Control ctl q' -> Control ctl $ q' >< t
+underk ::
+    (Member u ps (Prompt ans r'), Monad m) =>
+    Proxy u ->
+    (r -> r') ->
+    (b -> CtlT (Prompt ans r' : u) r' m a) ->
+    (b -> CtlT ps r m a)
+underk p f k x = CtlT $ FreerT $ ReaderT \r -> runReaderT (runFreerT $ unCtlT $ under p f (f r) (k x)) r
 
 liftCtlT :: (Functor f) => f a -> CtlT fs r f a
-liftCtlT a = CtlT \_ -> Pure <$> a
-
-runCtlT :: (Functor f) => r -> CtlT '[] r f a -> f a
-runCtlT r (CtlT m) =
-    m r <&> \case
-        Pure x -> x
-        Ctl ctls -> case ctls of {}
-
-runPure :: r -> CtlT '[] r Identity a -> a
-runPure r (CtlT m) = case runIdentity (m r) of
-    Pure x -> x
-    Ctl ctls -> case ctls of {}
+liftCtlT f = CtlT . liftFreerT $ ReaderT $ const f
 
 data Status a b ps v m r = Done r | Continue a (b -> CtlT ps v m (Status a b ps v m r))
 
