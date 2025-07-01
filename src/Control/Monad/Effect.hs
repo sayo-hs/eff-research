@@ -116,6 +116,7 @@ class EnvFunctor e where
         e (EffCtlT u es1 m) a
 
     fromCtl :: e (EffCtlT (Prompts m (BasePrompt es)) es m) a -> e (EffT es m) a
+    toCtl :: e (EffT es m) a -> e (EffCtlT (Prompts m (BasePrompt es)) es m) a
 
 mapHandler ::
     (EnvFunctor e, Monad m, EnvFunctors es1, EnvFunctors es2) =>
@@ -163,13 +164,13 @@ instance (Elem e es u) => Elem e (ans :/ es) u where
             { getHandler = \(ConsPrompt hs) -> getHandler membership hs
             }
 
-send ::
+sendCtl ::
     forall e es u m a.
     (Prompts m u C.< Prompts m (BasePrompt es), Monad m) =>
     Membership e es u ->
     e (EffCtlT (Prompts m u) es m) a ->
     EffT es m a
-send i e =
+sendCtl i e =
     EffT $ CtlT $ FreerT $ ReaderT \r@(Env hs) ->
         let Handler h r' = getHandler i hs
          in (`runReaderT` r)
@@ -232,6 +233,7 @@ newtype FirstOrder (e :: Effect) f a = FirstOrder (e f a)
 instance (forall f g x. Coercible (e f x) (e g x)) => EnvFunctor (FirstOrder e) where
     cmapEnv _ = coerce
     fromCtl = coerce
+    toCtl = coerce
 
 data Throw e :: Effect where
     Throw :: e -> Throw e f a
@@ -244,3 +246,4 @@ deriving via FirstOrder (Throw e) instance EnvFunctor (Throw e)
 instance EnvFunctor (Catch e) where
     cmapEnv f (Catch m k) = Catch (EffCtlT $ cmapCtlT f $ unEffCtlT m) (EffCtlT . cmapCtlT f . unEffCtlT . k)
     fromCtl = coerce
+    toCtl = coerce
