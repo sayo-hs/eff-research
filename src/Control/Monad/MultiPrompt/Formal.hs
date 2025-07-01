@@ -90,7 +90,7 @@ cmapCtlT :: (Monad m) => (r1 -> r2) -> CtlT ps r2 m a -> CtlT ps r1 m a
 cmapCtlT f (CtlT m) = CtlT \r ->
     m (f r) <&> \case
         Pure x -> Pure x
-        Ctl ctls -> Ctl $ forCtls ctls \case
+        Ctl ctls -> Ctl $ forStackUnion ctls \case
             Control ctl q -> Control ctl (tsingleton $ cmapCtlT f . qApp q)
 
 data CtlResult ps r m a
@@ -100,24 +100,12 @@ data CtlResult ps r m a
 type Ctls ps r m a = StackUnion ps (CtlFrame ps r m a)
 
 data CtlFrame (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) (u :: [PromptFrame]) where
-    PrimOp :: PrimOp ps r m a p u -> CtlFrame ps r m a p u
-    Under :: StackUnion u (CtlFrame ps r m a) -> CtlFrame ps r m a p u
-
-data PrimOp (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) (u :: [PromptFrame]) where
-    Control :: ((b -> CtlT u r' m ans) -> CtlT u r' m ans) -> FTCQueue (CtlT ps r m) b a -> PrimOp ps r m a (Prompt ans r') u
-
-mapCtls :: (forall x u. PrimOp ps r m a x u -> PrimOp ps' r' m' a' x u) -> StackUnion xs (CtlFrame ps r m a) -> StackUnion xs (CtlFrame ps' r' m' a')
-mapCtls f = mapStackUnion \case
-    PrimOp op -> PrimOp $ f op
-    Under u -> Under $ mapCtls f u
-
-forCtls :: StackUnion xs (CtlFrame ps r m a) -> (forall x u. PrimOp ps r m a x u -> PrimOp ps' r' m' a' x u) -> StackUnion xs (CtlFrame ps' r' m' a')
-forCtls u f = mapCtls f u
+    Control :: ((b -> CtlT u r' m ans) -> CtlT u r' m ans) -> FTCQueue (CtlT ps r m) b a -> CtlFrame ps r m a (Prompt ans r') u
 
 instance (Applicative f) => Functor (CtlResult ps r f) where
     fmap f = \case
         Pure x -> Pure $ f x
-        Ctl ctls -> Ctl $ forCtls ctls \case
+        Ctl ctls -> Ctl $ forStackUnion ctls \case
             Control ctl q -> Control ctl $ q |> (CtlT . const . pure . Pure . f)
 
 instance (Applicative f) => Functor (CtlT ps r f) where
@@ -132,7 +120,7 @@ instance (Monad m) => Monad (CtlT ps r m) where
         CtlT \r ->
             m r >>= \case
                 Pure x -> unCtlT (f x) r
-                Ctl ctls -> pure $ Ctl $ forCtls ctls \case
+                Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
                     Control ctl q -> Control ctl $ q |> f
 
 instance (MonadIO m) => MonadIO (CtlT ps r m) where
@@ -161,17 +149,14 @@ prompt f m =
         unCtlT (m Proxy) (f r) >>= \case
             Pure x -> pure $ Pure x
             Ctl ctls -> case ctls of
-                Here (PrimOp (Control ctl q)) -> unCtlT (ctl \x -> prompt f \_ -> qApp q x) r
-                Here (Under u) -> promptUnder u
-                There u -> promptUnder u
-  where
-    promptUnder :: StackUnion ps (CtlFrame (Prompt ans r' : ps) r m ans) -> m (CtlResult ps r' m ans)
-    promptUnder u =
-        pure $ Ctl $ forCtls u \case
-            Control ctl q -> Control ctl $ tsingleton \x -> prompt f \_ -> qApp q x
+                Here (Control ctl q) ->
+                    unCtlT (ctl \x -> prompt f \_ -> qApp q x) r
+                There u ->
+                    pure $ Ctl $ forStackUnion u \case
+                        Control ctl q -> Control ctl $ tsingleton \x -> prompt f \_ -> qApp q x
 
 control :: (Member u ps (Prompt ans r'), Applicative m) => Proxy u -> ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> CtlT ps r m a
-control p f = CtlT . const . pure . Ctl . inject p $ PrimOp $ Control f (tsingleton $ CtlT . const . pure . Pure)
+control p f = CtlT . const . pure . Ctl . inject p $ Control f (tsingleton $ CtlT . const . pure . Pure)
 
 abort :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> ans -> CtlT ps r m a
 abort p ans = control p \_ -> pure ans
@@ -182,12 +167,11 @@ under p f r (CtlT m) =
         m r <&> \case
             Pure x -> Pure x
             Ctl ctls -> Ctl $ case ctls of
-                Here (PrimOp (Control ctl q)) -> inject p $ PrimOp $ Control ctl (tsingleton $ under p f r . qApp q)
-                Here (Under u) -> mkUnder u
-                There u -> mkUnder u
-  where
-    mkUnder ctls = embed p $ forCtls ctls \case
-        Control ctl q -> Control ctl (tsingleton $ underk p f $ qApp q)
+                Here (Control ctl q) ->
+                    inject p $ Control ctl (tsingleton $ under p f r . qApp q)
+                There u ->
+                    embed p $ forStackUnion u \case
+                        Control ctl q -> Control ctl (tsingleton $ underk p f $ qApp q)
 
 underk :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> (r -> r') -> (b -> CtlT (Prompt ans r' : u) r' m a) -> (b -> CtlT ps r m a)
 underk p f k x = CtlT \r -> unCtlT (under p f (f r) $ k x) r
@@ -198,7 +182,7 @@ qApp q x = CtlT \r -> case tviewl q of
     k :| t ->
         unCtlT (k x) r >>= \case
             Pure y -> unCtlT (qApp t y) r
-            Ctl ctls -> pure $ Ctl $ forCtls ctls \case
+            Ctl ctls -> pure $ Ctl $ forStackUnion ctls \case
                 Control ctl q' -> Control ctl $ q' >< t
 
 liftCtlT :: (Functor f) => f a -> CtlT fs r f a
