@@ -49,7 +49,6 @@ forStackUnion u f = mapStackUnion f u
 class Member r xs x | r xs -> x where
     inj :: h x r a -> StackUnion xs h a
     prj :: StackUnion xs h a -> Maybe (h x r a)
-    emb :: StackUnion r h a -> StackUnion xs h a
 
 inject :: (Member r xs x) => Proxy r -> h x r a -> StackUnion xs h a
 inject _ = inj
@@ -57,21 +56,29 @@ inject _ = inj
 project :: (Member r xs x) => Proxy r -> StackUnion xs h a -> Maybe (h x r a)
 project _ = prj
 
-embed :: (Member r xs x) => Proxy r -> StackUnion r h a -> StackUnion xs h a
-embed _ = emb
-
 instance Member xs (x : xs) x where
     inj = Here
     prj = \case
         Here x -> Just x
         There _ -> Nothing
-    emb = There
 
 instance {-# OVERLAPPABLE #-} (Member r xs x) => Member r (x' : xs) x where
     inj = There . inj
     prj = \case
         Here _ -> Nothing
         There xs -> prj xs
+
+infix 4 <
+class r < xs where
+    emb :: StackUnion r h a -> StackUnion xs h a
+
+embed :: (r < xs) => Proxy r -> StackUnion r h a -> StackUnion xs h a
+embed _ = emb
+
+instance xs < x : xs where
+    emb = There
+
+instance (r < xs) => r < x : xs where
     emb = There . emb
 
 type data PromptFrame = Prompt Type Type
@@ -195,22 +202,18 @@ control p = CtlT . liftF . inject p . Control
 abort :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> ans -> CtlT ps r m a
 abort p ans = control p \_ -> pure ans
 
-under :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> (r -> r') -> r' -> CtlT (Prompt ans r' : u) r' m a -> CtlT ps r m a
+under :: (u < ps, Monad m) => Proxy u -> (r -> r') -> r' -> CtlT u r' m a -> CtlT ps r m a
 under p f r (CtlT (FreerT (ReaderT m))) =
     CtlT $ FreerT $ ReaderT \_ ->
         m r <&> \case
             Pure x -> Pure x
-            Freer ctls q ->
-                let k = tsingleton $ unCtlT . underk p f (CtlT . qApp q)
-                 in (`Freer` k) case ctls of
-                        Here (Control ctl) -> inject p $ Control ctl
-                        There u -> embed p u
+            Freer u q -> Freer (embed p u) (tsingleton $ unCtlT . underk p f (CtlT . qApp q))
 
 underk ::
-    (Member u ps (Prompt ans r'), Monad m) =>
+    (u < ps, Monad m) =>
     Proxy u ->
     (r -> r') ->
-    (b -> CtlT (Prompt ans r' : u) r' m a) ->
+    (b -> CtlT u r' m a) ->
     (b -> CtlT ps r m a)
 underk p f k x = CtlT $ FreerT $ ReaderT \r -> runReaderT (runFreerT $ unCtlT $ under p f (f r) (k x)) r
 
