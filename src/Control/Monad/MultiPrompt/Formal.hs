@@ -49,6 +49,7 @@ forStackUnion u f = mapStackUnion f u
 class Member r xs x | r xs -> x where
     inj :: h x r -> StackUnion xs h
     prj :: StackUnion xs h -> Maybe (h x r)
+    emb :: StackUnion r h -> StackUnion xs h
 
 inject :: (Member r xs x) => Proxy r -> h x r -> StackUnion xs h
 inject _ = inj
@@ -56,17 +57,22 @@ inject _ = inj
 project :: (Member r xs x) => Proxy r -> StackUnion xs h -> Maybe (h x r)
 project _ = prj
 
+embed :: (Member r xs x) => Proxy r -> StackUnion r h -> StackUnion xs h
+embed _ = emb
+
 instance Member xs (x : xs) x where
     inj = Here
     prj = \case
         Here x -> Just x
         There _ -> Nothing
+    emb = There
 
 instance {-# OVERLAPPABLE #-} (Member r xs x) => Member r (x' : xs) x where
     inj = There . inj
     prj = \case
         Here _ -> Nothing
         There xs -> prj xs
+    emb = There . emb
 
 type data PromptFrame = Prompt Type Type
 
@@ -95,7 +101,7 @@ type Ctls ps r m a = StackUnion ps (CtlFrame ps r m a)
 
 data CtlFrame (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) (u :: [PromptFrame]) where
     PrimOp :: PrimOp ps r m a p u -> CtlFrame ps r m a p u
-    Under :: StackUnion u (CtlFrame ps r m a) -> CtlFrame ps r m a (Prompt ans r') u
+    Under :: StackUnion u (CtlFrame ps r m a) -> CtlFrame ps r m a p u
 
 data PrimOp (ps :: [PromptFrame]) r (m :: Type -> Type) (a :: Type) (p :: PromptFrame) (u :: [PromptFrame]) where
     Control :: ((b -> CtlT u r' m ans) -> CtlT u r' m ans) -> FTCQueue (CtlT ps r m) b a -> PrimOp ps r m a (Prompt ans r') u
@@ -175,12 +181,12 @@ under p f r (CtlT m) =
     CtlT \_ ->
         m r <&> \case
             Pure x -> Pure x
-            Ctl ctls -> Ctl $ inject p $ case ctls of
-                Here (PrimOp (Control ctl q)) -> PrimOp $ Control ctl (tsingleton $ under p f r . qApp q)
+            Ctl ctls -> Ctl $ case ctls of
+                Here (PrimOp (Control ctl q)) -> inject p $ PrimOp $ Control ctl (tsingleton $ under p f r . qApp q)
                 Here (Under u) -> mkUnder u
                 There u -> mkUnder u
   where
-    mkUnder ctls = Under $ forCtls ctls \case
+    mkUnder ctls = embed p $ forCtls ctls \case
         Control ctl q -> Control ctl (tsingleton $ underk p f $ qApp q)
 
 underk :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> (r -> r') -> (b -> CtlT (Prompt ans r' : u) r' m a) -> (b -> CtlT ps r m a)
