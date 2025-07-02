@@ -47,39 +47,50 @@ forStackUnion :: StackUnion xs h a -> (forall x r. h x r a -> i x r a) -> StackU
 forStackUnion u f = mapStackUnion f u
 
 class Member r xs x | r xs -> x where
-    inj :: h x r a -> StackUnion xs h a
-    prj :: StackUnion xs h a -> Maybe (h x r a)
+    membership :: Membership r xs x
 
-inject :: (Member r xs x) => Proxy r -> h x r a -> StackUnion xs h a
-inject _ = inj
-
-project :: (Member r xs x) => Proxy r -> StackUnion xs h a -> Maybe (h x r a)
-project _ = prj
+data Membership (r :: [k]) (xs :: [k]) (x :: k)
+    = Membership
+    { inject :: forall l h (a :: l). h x r a -> StackUnion xs h a
+    , project :: forall l h (a :: l). StackUnion xs h a -> Maybe (h x r a)
+    }
 
 instance Member xs (x : xs) x where
-    inj = Here
-    prj = \case
-        Here x -> Just x
-        There _ -> Nothing
+    membership =
+        Membership
+            Here
+            \case
+                Here x -> Just x
+                There _ -> Nothing
+
+member :: (Member r xs x) => Proxy r -> Membership r xs x
+member _ = membership
 
 instance {-# OVERLAPPABLE #-} (Member r xs x) => Member r (x' : xs) x where
-    inj = There . inj
-    prj = \case
-        Here _ -> Nothing
-        There xs -> prj xs
+    membership =
+        Membership
+            (There . inject membership)
+            \case
+                Here _ -> Nothing
+                There xs -> project membership xs
 
 infix 4 <
 class r < xs where
-    emb :: StackUnion r h a -> StackUnion xs h a
+    sub :: Sub r xs
 
-embed :: (r < xs) => Proxy r -> StackUnion r h a -> StackUnion xs h a
-embed _ = emb
+newtype Sub (r :: [k]) (xs :: [k])
+    = Sub
+    { embed ::
+        forall l h (a :: l).
+        StackUnion r h a ->
+        StackUnion xs h a
+    }
 
 instance xs < x : xs where
-    emb = There
+    sub = Sub There
 
 instance (r < xs) => r < x : xs where
-    emb = There . emb
+    sub = Sub $ There . embed sub
 
 type data PromptFrame = Prompt Type Type
 
@@ -196,33 +207,37 @@ prompt f m =
                         Here (Control ctl) -> runReaderT (runFreerT $ unCtlT $ ctl k) r
                         There u -> pure $ Freer u (tsingleton $ unCtlT . k)
 
-control :: (Member u ps (Prompt ans r'), Applicative m) => Proxy u -> ((a -> CtlT u r' m ans) -> CtlT u r' m ans) -> CtlT ps r m a
-control p = CtlT . liftF . inject p . Control
+control ::
+    (Applicative m) =>
+    Membership u ps (Prompt ans r') ->
+    ((a -> CtlT u r' m ans) -> CtlT u r' m ans) ->
+    CtlT ps r m a
+control i = CtlT . liftF . inject i . Control
 
-abort :: (Member u ps (Prompt ans r'), Monad m) => Proxy u -> ans -> CtlT ps r m a
-abort p ans = control p \_ -> pure ans
+abort :: (Monad m) => Membership u ps (Prompt ans r') -> ans -> CtlT ps r m a
+abort i ans = control i \_ -> pure ans
 
-under :: (u < ps, Monad m) => Proxy u -> (r -> r') -> r' -> CtlT u r' m a -> CtlT ps r m a
-under p f r (CtlT (FreerT (ReaderT m))) =
+under :: (Monad m) => Sub u ps -> (r -> r') -> r' -> CtlT u r' m a -> CtlT ps r m a
+under s f r (CtlT (FreerT (ReaderT m))) =
     CtlT $ FreerT $ ReaderT \_ ->
         m r <&> \case
             Pure x -> Pure x
-            Freer u q -> Freer (embed p u) (tsingleton $ unCtlT . underk p f (CtlT . qApp q))
+            Freer u q -> Freer (embed s u) (tsingleton $ unCtlT . underk s f (CtlT . qApp q))
 
 underk ::
-    (u < ps, Monad m) =>
-    Proxy u ->
+    (Monad m) =>
+    Sub u ps ->
     (r -> r') ->
     (b -> CtlT u r' m a) ->
     (b -> CtlT ps r m a)
-underk p f k x = CtlT $ FreerT $ ReaderT \r -> runReaderT (runFreerT $ unCtlT $ under p f (f r) (k x)) r
+underk s f k x = CtlT $ FreerT $ ReaderT \r -> runReaderT (runFreerT $ unCtlT $ under s f (f r) (k x)) r
 
 liftCtlT :: (Functor f) => f a -> CtlT fs r f a
 liftCtlT f = CtlT . liftFreerT $ ReaderT $ const f
 
 data Status a b ps v m r = Done r | Continue a (b -> CtlT ps v m (Status a b ps v m r))
 
-yield :: (Member u ps (Prompt (Status a b u v m r) v), Monad m) => Proxy u -> a -> CtlT ps v m b
+yield :: (Monad m) => Membership u ps (Prompt (Status a b u v m r) v) -> a -> CtlT ps v m b
 yield p x = control p \k -> pure $ Continue x k
 
 runCoroutine ::
@@ -235,7 +250,7 @@ test :: IO ()
 test = runCtlT () do
     s <- runCoroutine \c -> do
         liftIO $ putStrLn "a"
-        i <- yield c 0
+        i <- yield (member c) 0
         liftIO $ print i
     case s of
         Continue (x :: Int) resume -> do

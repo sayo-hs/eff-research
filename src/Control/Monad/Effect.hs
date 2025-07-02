@@ -17,6 +17,7 @@ import Control.Monad.MultiPrompt.Formal (
     FreerF (Pure),
     FreerT (FreerT),
     PromptFrame (..),
+    Sub,
     cmapCtlT,
     runCtlT,
     runFreerT,
@@ -75,8 +76,11 @@ mapEnv ::
 mapEnv f (Env hs) = Env $ mapHandlers (mapEnv f) $ f hs
 
 -- | A effect handler.
-data Handler (m :: Type -> Type) (w :: Frames) (e :: Effect) (u :: Frames) where
-    Handler :: (forall x. e (EffCtlT (Prompts m u) w m) x -> EffCtlT (Prompts m u) u m x) -> Env m u -> Handler m w e u
+data Handler (m :: Type -> Type) (w :: Frames) (e :: Effect) (u :: Frames)
+    = Handler
+    { handler :: forall x. e (EffCtlT (Prompts m u) w m) x -> EffCtlT (Prompts m u) u m x
+    , envOnHandler :: Env m u
+    }
 
 -- | Vector of handlers.
 data Handlers (m :: Type -> Type) (w :: Frames) (es :: Frames) where
@@ -126,7 +130,11 @@ mapHandler ::
 mapHandler f = \case
     Handler h v -> Handler (h . cmapEnv f) v
 
-(!:) :: (EnvFunctor e, EnvFunctors es, Monad m) => Handler m es e (BasePrompt es) -> Env m es -> Env m (ConsFrame (E e) es)
+(!:) ::
+    (EnvFunctor e, EnvFunctors es, Monad m) =>
+    Handler m es e (BasePrompt es) ->
+    Env m es ->
+    Env m (ConsFrame (E e) es)
 h@(Handler _ _) !: Env hs = Env $ ConsHandler (mapHandler (h !:) h) (mapHandlers (h !:) hs)
 
 class IsFrame e where
@@ -138,52 +146,48 @@ instance (EnvFunctor e) => IsFrame (E e) where
 instance IsFrame (P ans) where
     dropEnv (Env (ConsPrompt hs)) = Env $ mapHandlers dropEnv hs
 
-newtype Membership e es u = Membership
-    { getHandler :: forall w m. Handlers m w es -> Handler m w e u
+data Membership e es u m = Membership
+    { getHandler :: forall w. Handlers m w es -> Handler m w e u
+    , promptEvidence :: Sub (Prompts m es) (Prompts m u)
     }
 
 -- | Type-level search over elements in a vector.
-class Elem e (es :: Frames) u | e es -> u where
-    membership :: Membership e es u
+class Elem e (es :: Frames) u m | e es -> u where
+    membership :: Membership e es u m
 
-instance (u ~ BasePrompt es) => Elem e (e :+ es) u where
+instance (u ~ BasePrompt es) => Elem e (e :+ es) u m where
     membership =
         Membership
             { getHandler = \(ConsHandler h _) -> h
             }
 
-instance {-# OVERLAPPABLE #-} (Elem e es u) => Elem e (e' :+ es) u where
+instance {-# OVERLAPPABLE #-} (Elem e es u m) => Elem e (e' :+ es) u m where
     membership =
         Membership
             { getHandler = \(ConsHandler _ hs) -> getHandler membership hs
             }
 
-instance (Elem e es u) => Elem e (ans :/ es) u where
+instance (Elem e es u m) => Elem e (ans :/ es) u m where
     membership =
         Membership
             { getHandler = \(ConsPrompt hs) -> getHandler membership hs
             }
 
 sendCtl ::
-    forall e es u m a.
-    (Prompts m u C.< Prompts m (BasePrompt es), Monad m) =>
-    Membership e es u ->
+    forall e ps es u m a.
+    (Prompts m u C.< ps, Monad m) =>
+    Membership e es u m ->
     e (EffCtlT (Prompts m u) es m) a ->
-    EffT es m a
+    EffCtlT ps es m a
 sendCtl i e =
-    EffT $ CtlT $ FreerT $ ReaderT \r@(Env hs) ->
+    EffCtlT $ CtlT $ FreerT $ ReaderT \r@(Env hs) ->
         let Handler h r' = getHandler i hs
          in (`runReaderT` r)
                 . runFreerT
                 . unCtlT
-                . under Proxy (\(Env hs') -> let Handler _ r'' = getHandler i hs' in r'') r'
+                . under Proxy (envOnHandler . getHandler i . unEnv) r'
                 . unEffCtlT
                 $ h e
-
-sendTail :: forall e es m a. (Functor m) => Membership e es Nil -> e (EffCtlT '[] es m) a -> EffT es m a
-sendTail i e = EffT $ CtlT $ FreerT $ ReaderT \(Env hs) ->
-    let Handler h _ = getHandler i hs
-     in Pure <$> runCtlT (Env Nil) (unEffCtlT $ h e)
 
 class (EnvFunctors es) => Base es where
     dropToBasePrompt :: (Monad m) => Env m es -> Env m (BasePrompt es)
