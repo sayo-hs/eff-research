@@ -98,9 +98,17 @@ newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Env m es) m a}
     deriving (Functor, Applicative, Monad)
 
 -- | A type-class for higher-order effects.
-class EnvFunctor e where
+class (PreEnvFunctor e) => EnvFunctor e where
     cmapEnv ::
         (Monad m) =>
+        (Env m es1 -> Env m es2) ->
+        e (EffCtlT u es2 m) a ->
+        e (EffCtlT u es1 m) a
+
+-- | A type-class for higher-order effects.
+class PreEnvFunctor e where
+    cmapEnvPre ::
+        (Monad m, DropToPromptBase es1 ~ DropToPromptBase es2) =>
         (Env m es1 -> Env m es2) ->
         e (EffCtlT u es2 m) a ->
         e (EffCtlT u es1 m) a
@@ -319,6 +327,9 @@ newtype FirstOrder (e :: Effect) f a = FirstOrder (e f a)
 
 instance (forall f g x. Coercible (e f x) (e g x)) => EnvFunctor (FirstOrder e) where
     cmapEnv _ = coerce
+
+instance (forall f g x. Coercible (e f x) (e g x)) => PreEnvFunctor (FirstOrder e) where
+    cmapEnvPre _ = coerce
     fromCtl = coerce
     toCtl = coerce
 
@@ -329,16 +340,20 @@ data Catch e :: Effect where
     Catch :: f a -> (e -> f a) -> Catch e f a
 
 deriving via FirstOrder (Throw e) instance EnvFunctor (Throw e)
+deriving via FirstOrder (Throw e) instance PreEnvFunctor (Throw e)
 
 instance EnvFunctor (Catch e) where
     cmapEnv f (Catch m k) = Catch (EffCtlT $ cmapCtlT f $ unEffCtlT m) (EffCtlT . cmapCtlT f . unEffCtlT . k)
+
+instance PreEnvFunctor (Catch e) where
+    cmapEnvPre = cmapEnv
     fromCtl = coerce
     toCtl = coerce
 
 data Try e :: Effect where
     Try :: (Throw e !+ m) a -> Try e m (Either e a)
 
-instance EnvFunctor (Try e) where
-    cmapEnv f (Try m) = undefined -- Try $ EffCtlT . cmapCtlT (mapUnderEnv f) . unEffCtlT $ m
+instance PreEnvFunctor (Try e) where
+    cmapEnvPre f (Try m) = Try $ EffCtlT . cmapCtlT (mapUnderEnv f) . unEffCtlT $ m
     fromCtl (Try m) = Try $ coerce m
     toCtl (Try m) = Try $ coerce m
