@@ -65,7 +65,7 @@ newtype Env m es = Env {unEnv :: Handlers m es es}
 
 mapEnv ::
     (Monad m, EnvFunctors es1, EnvFunctors es2) =>
-    (forall w. Handlers m w es1 -> Handlers m w es2) ->
+    (Handlers m es1 es1 -> Handlers m es1 es2) ->
     Env m es1 ->
     Env m es2
 mapEnv f (Env hs) = Env $ mapHandlers (mapEnv f) $ f hs
@@ -156,6 +156,22 @@ mapUnder ::
     Handlers m w (e :+ es) ->
     Handlers m w (e :+ es')
 mapUnder f (ConsHandler h hs) = ConsHandler h (f hs)
+
+mapUnderEnv ::
+    (EnvFunctor e, EnvFunctors es, EnvFunctors es', Monad m) =>
+    (DropToPromptBase es ~ DropToPromptBase es') =>
+    (Env m es -> Env m es') ->
+    Env m (e :+ es) ->
+    Env m (e :+ es')
+mapUnderEnv f v@(Env (ConsHandler h _)) =
+    Env $
+        ConsHandler
+            (mapHandler (mapUnderEnv f) h)
+            (let f' = f . dropEnv in mapHandlers (mapHandler f' h !:) $ unEnv $ f' v)
+
+type family e !+ m where
+    e !+ EffT es m = EffT (e :+ es) m
+    e !+ EffCtlT ps es m = EffCtlT ps (e :+ es) m
 
 type family a == b where
     a == a = 'True
@@ -323,3 +339,11 @@ instance EnvFunctor (Catch e) where
     cmapEnv f (Catch m k) = Catch (EffCtlT $ cmapCtlT f $ unEffCtlT m) (EffCtlT . cmapCtlT f . unEffCtlT . k)
     fromCtl = coerce
     toCtl = coerce
+
+data Try e :: Effect where
+    Try :: (Throw e !+ m) a -> Try e m (Either e a)
+
+instance EnvFunctor (Try e) where
+    cmapEnv f (Try m) = Try $ EffCtlT . cmapCtlT (mapUnderEnv undefined) . unEffCtlT $ m
+    fromCtl (Try m) = Try $ coerce m
+    toCtl (Try m) = Try $ coerce m
