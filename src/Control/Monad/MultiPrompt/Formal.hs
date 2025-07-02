@@ -89,8 +89,14 @@ newtype Sub (r :: [k]) (xs :: [k])
 instance xs < x : xs where
     sub = Sub There
 
-instance (r < xs) => r < x : xs where
+instance {-# OVERLAPPABLE #-} (r < xs) => r < x : xs where
     sub = Sub $ There . embed sub
+
+instance {-# INCOHERENT #-} xs < xs where
+    sub = Sub id
+
+instance '[] < xs where
+    sub = Sub \case {}
 
 type data PromptFrame = Prompt Type Type
 
