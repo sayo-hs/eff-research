@@ -72,12 +72,12 @@ newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Env m es) m a}
     deriving (Functor, Applicative, Monad)
 
 class EnvFunctor (e :: Effect) where
-    cmapEnv :: (Env m es -> Env m es') -> e (EffCtlT ps es' m) a -> e (EffCtlT ps es m) a
+    cmapEnv :: (Monad m) => (Env m es -> Env m es') -> e (EffCtlT ps es' m) a -> e (EffCtlT ps es m) a
     fromCtlH :: e (EffCtlT (Prompts m es) es m) a -> e (EffT es m) a
     toCtlH :: e (EffT es m) a -> e (EffCtlT (Prompts m es) es m) a
 
 class EnvFunctors es where
-    mapHandlers :: (Env m w -> Env m w') -> Handlers m w es -> Handlers m w' es
+    mapHandlers :: (Monad m) => (Env m w -> Env m w') -> Handlers m w es -> Handlers m w' es
 
 instance EnvFunctors '[] where
     mapHandlers _ _ = Nil
@@ -88,14 +88,18 @@ instance (EnvFunctor e, EnvFunctors es) => EnvFunctors (E e : es) where
 instance (EnvFunctors es) => EnvFunctors (P a : es) where
     mapHandlers f (ConsPrompt hs) = ConsPrompt $ mapHandlers f hs
 
-mapEnv :: (EnvFunctors es') => (Handlers m es es -> Handlers m es es') -> Env m es -> Env m es'
+mapEnv :: (EnvFunctors es', Monad m) => (Handlers m es es -> Handlers m es es') -> Env m es -> Env m es'
 mapEnv f (Env hs) = Env $ mapHandlers (mapEnv f) (f hs)
 
-mapEnv2 :: (EnvFunctors es) => (Handlers m es' es -> Handlers m es' es') -> Env m es -> Env m es'
-mapEnv2 f (Env hs) = Env $ f $ mapHandlers (mapEnv2 f) hs
+mapEnvShallow :: (EnvFunctors es, Monad m) => (Handlers m es' es -> Handlers m es' es') -> Env m es -> Env m es'
+mapEnvShallow f (Env hs) = Env $ f $ mapHandlers (mapEnvShallow f) hs
 
-(!:) :: (EnvFunctor e, EnvFunctors es) => Handler m es e es -> Env m es -> Env m (e :+ es)
-h !: r = mapEnv (ConsHandler h) r
+(!:) ::
+    (EnvFunctors es, Monad m) =>
+    (forall x. e (EffCtlT (Prompts m es) (e :+ es) m) x -> EffCtlT (Prompts m es) es m x) ->
+    Env m es ->
+    Env m (e :+ es)
+h !: Env r = Env $ ConsHandler (Handler h (mapHandlers (h !:) r)) (mapHandlers (h !:) r)
 
 class IsFrame e where
     dropHandler :: (Monad m) => Handlers m w (e : es) -> Handlers m w es
@@ -166,11 +170,11 @@ send i e = EffT . unEffCtlT $ sendCtl (promptEvidence i) i (cmapEnv (mapEnv $ dr
 
 interpret ::
     (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall x. e (EffT es m) x -> EffT es m x) ->
+    (forall x. e (EffT (e :+ es) m) x -> EffT es m x) ->
     EffT (e :+ es) m a ->
     EffT es m a
 interpret f (EffT m) =
-    EffT $ cmapCtlT (\r -> Handler (EffCtlT . unEffT . f . fromCtlH) (unEnv r) !: r) m
+    EffT $ cmapCtlT (\r -> (EffCtlT . unEffT . f . fromCtlH) !: r) m
 
 prompt :: (Monad m, EnvFunctors es) => EffT (a :/ es) m a -> EffT es m a
 prompt (EffT m) = EffT $ C.prompt (mapEnv ConsPrompt) $ const m
@@ -179,7 +183,7 @@ interpretBy ::
     forall e a b es m.
     (Monad m, EnvFunctor e, EnvFunctors es) =>
     (a -> EffT es m b) ->
-    (forall x. e (EffT (b :/ es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
+    (forall x. e (EffT (e :+ b :/ es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
     EffT (e :+ b :/ es) m a ->
     EffT es m b
 interpretBy ret hdl m =
@@ -237,14 +241,25 @@ test = runPure . runExc $ perform $ Throw @Int 3
 
 data Reader r :: Effect where
     Ask :: Reader r es r
+    Local :: (r -> r) -> m a -> Reader r m a
 
-deriving via FirstOrder (Reader r) instance EnvFunctor (Reader r)
+instance EnvFunctor (Reader r) where
+    cmapEnv f = \case
+        Ask -> Ask
+        Local g m -> Local g $ EffCtlT . cmapCtlT f $ unEffCtlT m
+    fromCtlH = coerce
+    toCtlH = coerce
+
+runReader :: (Monad m, EnvFunctors es) => r -> EffT (Reader r :+ es) m a -> EffT es m a
+runReader r = interpret \case
+    Ask -> pure r
+    Local f m -> runReader (f r) m
 
 runReader1 :: (Monad m, EnvFunctors es) => EffT (Reader Int :+ es) m a -> EffT es m a
-runReader1 = interpret \Ask -> pure 1
+runReader1 = runReader 1
 
 runReader2 :: (Monad m, EnvFunctors es) => EffT (Reader Int :+ es) m a -> EffT es m a
-runReader2 = interpret \Ask -> pure 2
+runReader2 = runReader 2
 
 data Evil :: Effect where
     Evil :: Evil es ()
