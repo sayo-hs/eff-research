@@ -101,12 +101,12 @@ instance '[] < xs where
 type data PromptFrame = Prompt Type Type
 
 -- | The base functor for a freer monad.
-data FreerF f g a
+data FreerF f a g
     = Pure a
     | forall x. Freer (f x) (FTCQueue g x a)
 
 -- | The freer monad transformer for a type constructor @f@
-newtype FreerT f m a = FreerT {runFreerT :: m (FreerF f (FreerT f m) a)}
+newtype FreerT f m a = FreerT {runFreerT :: m (FreerF f a (FreerT f m))}
 
 instance (Applicative g) => Functor (FreerT f g) where
     fmap f (FreerT m) =

@@ -34,7 +34,7 @@ type Effect = (Type -> Type) -> Type -> Type
 infixr 6 :+
 infixr 6 :/
 
-type data Frames = Type :/ Frames | Effect :+ Frames | Nil
+type data Frames = Effect :+ Frames | Type :/ Frames | Nil
 
 type data Frame = E Effect | P Type
 
@@ -151,25 +151,6 @@ mapUnder f (HandlersCoyoneda (ConsHandler h hs) k) =
     HandlersCoyoneda
         (ConsHandler (mapHandler k h) (f $ mapHandlers k hs))
         id
-
-mapUnderEnv ::
-    (EnvFunctor e, Monad m) =>
-    (DropToPromptBase es ~ DropToPromptBase es') =>
-    (Env m es -> Env m es') ->
-    Env m (e :+ es) ->
-    Env m (e :+ es')
-mapUnderEnv f v@(Env (HandlersCoyoneda (ConsHandler h _) k)) =
-    Env $
-        HandlersCoyoneda
-            ( ConsHandler
-                (mapHandler (mapUnderEnv f . k) h)
-                (let f' = f . dropEnv in mapHandlers (mapHandler (f' . k) h !:) $ unEnv $ f' v)
-            )
-            id
-
-type family e !+ m where
-    e !+ EffT es m = EffT (e :+ es) m
-    e !+ EffCtlT ps es m = EffCtlT ps (e :+ es) m
 
 type family a == b where
     a == a = 'True
@@ -351,9 +332,24 @@ instance PreEnvFunctor (Catch e) where
     toCtl = coerce
 
 data Try e :: Effect where
-    Try :: (Throw e !+ m) a -> Try e m (Either e a)
+    Try :: EffT Nil m a -> Try e m (Either e a)
 
+{-
 instance PreEnvFunctor (Try e) where
     cmapEnvPre f (Try m) = Try $ EffCtlT . cmapCtlT (mapUnderEnv f) . unEffCtlT $ m
     fromCtl (Try m) = Try $ coerce m
     toCtl (Try m) = Try $ coerce m
+-}
+
+{-
+effect delimit
+    delimit : m a -> m a
+
+a : {yield,delimit,io} ()
+a = do
+    delimit do
+        yield
+        print 1
+    print 2
+
+-}
