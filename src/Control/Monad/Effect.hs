@@ -12,6 +12,7 @@
 
 module Control.Monad.Effect where
 
+import Control.Monad (join)
 import Control.Monad.MultiPrompt.Formal (
     CtlT (..),
     FreerT (FreerT),
@@ -171,23 +172,16 @@ instance PromptBase m Nil where
     dropHandlersToPromptBase = id
     extendPromptBase _ = id
 
-interpret_ ::
+interpret ::
     (PromptBase m es, Monad m) =>
     (forall x. e x -> EffT es m x) ->
     EffT (e :+ es) m a ->
     EffT es m a
-interpret_ f (EffT m) =
+interpret f (EffT m) =
     EffT $ cmapCtlT (\r -> Handler (EffCtlT . cmapCtlT (extendPromptBase r) . unEffT . f) (dropHandlersToPromptBase r) !: r) m
 
 prompt :: (Monad m) => EffT (a :/ es) m a -> EffT es m a
 prompt (EffT m) = EffT $ C.prompt ConsPrompt $ const m
-
-interpret ::
-    (Monad m) =>
-    (forall x. e x -> EffT (a :/ es) m x) ->
-    EffT (e :+ a :/ es) m a ->
-    EffT es m a
-interpret f m = prompt $ interpret_ f m
 
 interpretBy ::
     forall e a b es m.
@@ -197,7 +191,7 @@ interpretBy ::
     EffT (e :+ b :/ es) m a ->
     EffT es m b
 interpretBy ret hdl m =
-    interpret (\e -> control C.membership \k -> hdl e k) (m >>= raiseEP . ret)
+    prompt $ interpret (\e -> control C.membership \k -> hdl e k) (m >>= raiseEP . ret)
 
 raise :: (Monad m) => EffT es m a -> EffT (e :+ es) m a
 raise = EffT . cmapCtlT dropHandler . unEffT
@@ -231,8 +225,37 @@ data Throw e :: Effect where
 runExc :: (Monad m) => EffT (Throw e :+ Either e a :/ es) m a -> EffT es m (Either e a)
 runExc = interpretBy (pure . Right) (\(Throw e) _ -> pure $ Left e)
 
+perform :: (Elem e es m u) => e a -> EffT es m a
+perform = send membership
+
 -- >>> test
 -- Left 3
 
 test :: Either Int ()
-test = runPure . runExc $ send membership $ Throw @Int 3
+test = runPure . runExc $ perform $ Throw @Int 3
+
+data Reader r :: Effect where
+    Ask :: Reader r r
+
+runReader1 :: (Monad m, PromptBase m es) => EffT (Reader Int :+ es) m a -> EffT es m a
+runReader1 = interpret \Ask -> pure 1
+
+runReader2 :: (Monad m, PromptBase m es) => EffT (Reader Int :+ es) m a -> EffT es m a
+runReader2 = interpret \Ask -> pure 2
+
+data Evil :: Effect where
+    Evil :: Evil ()
+
+runEvil :: (Monad m) => EffT (Evil :+ EffT es m a :/ es) m a -> EffT es m (EffT es m a)
+runEvil = interpretBy (pure . pure) \Evil k -> pure $ join $ k ()
+
+-- >>> evilTest
+-- 2
+
+evilTest :: Int
+evilTest = runPure do
+    m <- runReader1 $ runEvil do
+        _ <- perform $ Ask @Int
+        perform Evil
+        perform $ Ask @Int
+    runReader2 m
