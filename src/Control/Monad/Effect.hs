@@ -43,7 +43,7 @@ type family ConsFrame e = r | r -> e where
 
 type family Prompts m es where
     Prompts m (_ :+ es) = Prompts m es
-    Prompts m (ans :/ es) = Prompt ans (Handlers m (ans :/ es)) : Prompts m (DropToPromptBase es)
+    Prompts m (ans :/ es) = Prompt ans (Handlers m es) : Prompts m (DropToPromptBase es)
     Prompts _ Nil = '[]
 
 type family Effects es where
@@ -171,16 +171,53 @@ instance PromptBase m Nil where
     dropHandlersToPromptBase = id
     extendPromptBase _ = id
 
-interpret ::
+interpret_ ::
     (PromptBase m es, Monad m) =>
     (forall x. e x -> EffT es m x) ->
     EffT (e :+ es) m a ->
     EffT es m a
-interpret f (EffT m) =
+interpret_ f (EffT m) =
     EffT $ cmapCtlT (\r -> Handler (EffCtlT . cmapCtlT (extendPromptBase r) . unEffT . f) (dropHandlersToPromptBase r) !: r) m
 
 prompt :: (Monad m) => EffT (a :/ es) m a -> EffT es m a
-prompt (EffT m) = EffT $ cmapCtlT ConsPrompt $ C.prompt id $ const m
+prompt (EffT m) = EffT $ C.prompt ConsPrompt $ const m
+
+interpret ::
+    (Monad m) =>
+    (forall x. e x -> EffT (a :/ es) m x) ->
+    EffT (e :+ a :/ es) m a ->
+    EffT es m a
+interpret f m = prompt $ interpret_ f m
+
+interpretBy ::
+    forall e a b es m.
+    (Monad m) =>
+    (a -> EffT es m b) ->
+    (forall x. e x -> (x -> EffT es m b) -> EffT es m b) ->
+    EffT (e :+ b :/ es) m a ->
+    EffT es m b
+interpretBy ret hdl m =
+    interpret (\e -> control C.membership \k -> hdl e k) (m >>= raiseEP . ret)
+
+raise :: (Monad m) => EffT es m a -> EffT (e :+ es) m a
+raise = EffT . cmapCtlT dropHandler . unEffT
+
+raisePrompt :: (Monad m) => EffT es m a -> EffT (a' :/ es) m a
+raisePrompt = EffT . cmapCtlT dropHandler . C.raise . unEffT
+
+raiseEP :: (Monad m) => EffT es m a -> EffT (e :+ a' :/ es) m a
+raiseEP = EffT . cmapCtlT (dropHandler . dropHandler) . C.raise . unEffT
+
+control ::
+    forall ans u es m a.
+    (Monad m) =>
+    C.Membership
+        (Prompts m (DropToPromptBase u))
+        (Prompts m (DropToPromptBase es))
+        (Prompt ans (Handlers m u)) ->
+    ((a -> EffT u m ans) -> EffT u m ans) ->
+    EffT es m a
+control i f = EffT $ C.control i \k -> unEffT $ f $ EffT . k
 
 runPure :: EffT Nil Identity a -> a
 runPure = C.runPure Nil . unEffT
@@ -190,3 +227,12 @@ runEffT = runCtlT Nil . unEffT
 
 data Throw e :: Effect where
     Throw :: e -> Throw e a
+
+runExc :: (Monad m) => EffT (Throw e :+ Either e a :/ es) m a -> EffT es m (Either e a)
+runExc = interpretBy (pure . Right) (\(Throw e) _ -> pure $ Left e)
+
+-- >>> test
+-- Left 3
+
+test :: Either Int ()
+test = runPure . runExc $ send membership $ Throw @Int 3

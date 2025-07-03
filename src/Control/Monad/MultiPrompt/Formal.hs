@@ -238,8 +238,11 @@ underk ::
     (b -> CtlT ps r m a)
 underk s f k x = CtlT $ FreerT $ ReaderT \r -> runReaderT (runFreerT $ unCtlT $ under s f (f r) (k x)) r
 
-liftCtlT :: (Functor f) => f a -> CtlT fs r f a
+liftCtlT :: (Functor f) => f a -> CtlT ps r f a
 liftCtlT f = CtlT . liftFreerT $ ReaderT $ const f
+
+raise :: (Monad m) => CtlT ps r m a -> CtlT (p : ps) r m a
+raise = CtlT . transFreerT There . unCtlT
 
 data Status a b ps v m r = Done r | Continue a (b -> CtlT ps v m (Status a b ps v m r))
 
