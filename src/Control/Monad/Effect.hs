@@ -28,7 +28,6 @@ import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.Coerce (Coercible, coerce)
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
-import Data.Type.Equality ((:~:) (Refl))
 
 type Effect = [Frame] -> Type -> Type
 
@@ -40,14 +39,9 @@ type e :/ es = P e : es
 
 type data Frame = E Effect | P Type
 
-type family DropToPromptBase es where
-    DropToPromptBase (_ :+ es) = DropToPromptBase es
-    DropToPromptBase (ans :/ es) = ans :/ es
-    DropToPromptBase '[] = '[]
-
 type family Prompts m es where
     Prompts m (_ :+ es) = Prompts m es
-    Prompts m (ans :/ es) = Prompt ans (Env m es) : Prompts m (DropToPromptBase es)
+    Prompts m (ans :/ es) = Prompt ans (Env m es) : Prompts m es
     Prompts _ '[] = '[]
 
 type family FrameList es where
@@ -66,12 +60,12 @@ data Handler (m :: Type -> Type) (w :: [Frame]) (e :: Effect) (u :: [Frame])
 
 -- | Vector of handlers.
 data Handlers (m :: Type -> Type) (w :: [Frame]) (es :: [Frame]) where
-    ConsHandler :: Handler m w e (DropToPromptBase es) -> Handlers m w es -> Handlers m w (e :+ es)
+    ConsHandler :: Handler m w e es -> Handlers m w es -> Handlers m w (e :+ es)
     ConsPrompt :: Handlers m w es -> Handlers m w (ans :/ es)
     Nil :: Handlers w m '[]
 
 -- | An effect monad built on top of a multi-prompt/control monad.
-newtype EffT es m a = EffT {unEffT :: CtlT (Prompts m (DropToPromptBase es)) (Env m es) m a}
+newtype EffT es m a = EffT {unEffT :: CtlT (Prompts m es) (Env m es) m a}
     deriving (Functor, Applicative, Monad)
 
 newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Env m es) m a}
@@ -86,7 +80,7 @@ class EnvFunctors es where
 instance EnvFunctors '[] where
     mapHandlers _ _ = Nil
 
-instance (EnvFunctor e, EnvFunctors es, EnvFunctors (DropToPromptBase es)) => EnvFunctors (E e : es) where
+instance (EnvFunctor e, EnvFunctors es) => EnvFunctors (E e : es) where
     mapHandlers f (ConsHandler (Handler h r) hs) = ConsHandler (Handler (h . cmapEnv f) $ mapHandlers f r) (mapHandlers f hs)
 
 instance (EnvFunctors es) => EnvFunctors (P a : es) where
@@ -98,7 +92,7 @@ mapEnv f (Env hs) = Env $ mapHandlers (mapEnv f) (f hs)
 mapEnv2 :: (EnvFunctors es) => (Handlers m es' es -> Handlers m es' es') -> Env m es -> Env m es'
 mapEnv2 f (Env hs) = Env $ f $ mapHandlers (mapEnv2 f) hs
 
-(!:) :: (EnvFunctor e, EnvFunctors es, EnvFunctors (DropToPromptBase es)) => Handler m es e (DropToPromptBase es) -> Env m es -> Env m (e :+ es)
+(!:) :: (EnvFunctor e, EnvFunctors es) => Handler m es e es -> Env m es -> Env m (e :+ es)
 h !: r = mapEnv (ConsHandler h) r
 
 class IsFrame e where
@@ -116,16 +110,16 @@ class (Monad m) => Elem e (es :: [Frame]) m u | e es -> u where
 
 data Membership e es m u = Membership
     { getHandler :: forall w. Handlers m w es -> Handler m w e u
-    , promptEvidence :: Sub (Prompts m u) (Prompts m (DropToPromptBase es))
+    , promptEvidence :: Sub (Prompts m u) (Prompts m es)
     , dropUnder :: forall w. Handlers m w es -> Handlers m w u
     }
 
-instance (PromptBase m es, u ~ DropToPromptBase es, Monad m) => Elem e (e :+ es) m u where
+instance (Monad m) => Elem e (e :+ es) m es where
     membership =
         Membership
             { getHandler = \(ConsHandler h _) -> h
             , promptEvidence = C.sub
-            , dropUnder = dropToPromptBase . dropHandler
+            , dropUnder = dropHandler
             }
 
 instance {-# OVERLAPPABLE #-} (Elem e es m u) => Elem e (e' :+ es) m u where
@@ -165,39 +159,13 @@ sendCtl sub i e =
 send :: forall e es m u a. (Monad m, EnvFunctors u) => Membership e es m u -> e es a -> EffT es m a
 send i e = EffT . unEffCtlT $ sendCtl (promptEvidence i) i e
 
-class PromptBase m es where
-    promptBaseEquality :: Prompts m es :~: Prompts m (DropToPromptBase es)
-    dropToPromptBase :: (Monad m) => forall w. Handlers m w es -> Handlers m w (DropToPromptBase es)
-    extendPromptBase :: (Monad m) => Handlers m w es -> Handlers m w (DropToPromptBase es) -> Handlers m w es
-
-instance (PromptBase m es) => PromptBase m (e :+ es) where
-    promptBaseEquality = case promptBaseEquality @m @es of
-        Refl -> Refl
-
-    dropToPromptBase = dropToPromptBase . dropHandler
-
-    extendPromptBase (ConsHandler h hs) hs' = ConsHandler h $ extendPromptBase hs hs'
-
-instance PromptBase m (ans :/ es) where
-    promptBaseEquality = Refl
-    dropToPromptBase = id
-    extendPromptBase _ = id
-
-instance PromptBase m '[] where
-    promptBaseEquality = Refl
-    dropToPromptBase = id
-    extendPromptBase _ = id
-
-extendEnvPromptBase :: (Monad m, PromptBase m es, EnvFunctors (DropToPromptBase es)) => Env m es -> Env m (DropToPromptBase es) -> Env m es
-extendEnvPromptBase r@(Env hs) (Env hs') = Env $ extendPromptBase hs $ mapHandlers (extendEnvPromptBase r) hs'
-
 interpret ::
-    (PromptBase m es, Monad m, EnvFunctor e, EnvFunctors es, EnvFunctors (DropToPromptBase es)) =>
+    (Monad m, EnvFunctor e, EnvFunctors es) =>
     (forall x. e es x -> EffT es m x) ->
     EffT (e :+ es) m a ->
     EffT es m a
 interpret f (EffT m) =
-    EffT $ cmapCtlT (\r -> Handler (EffCtlT . cmapCtlT (extendEnvPromptBase r) . unEffT . f) (dropToPromptBase $ unEnv r) !: r) m
+    EffT $ cmapCtlT (\r -> Handler (EffCtlT . unEffT . f) (unEnv r) !: r) m
 
 prompt :: (Monad m, EnvFunctors es) => EffT (a :/ es) m a -> EffT es m a
 prompt (EffT m) = EffT $ C.prompt (mapEnv ConsPrompt) $ const m
@@ -225,8 +193,8 @@ control ::
     forall ans u es m a.
     (Monad m) =>
     C.Membership
-        (Prompts m (DropToPromptBase u))
-        (Prompts m (DropToPromptBase es))
+        (Prompts m u)
+        (Prompts m es)
         (Prompt ans (Env m u)) ->
     ((a -> EffT u m ans) -> EffT u m ans) ->
     EffT es m a
@@ -265,10 +233,10 @@ data Reader r :: Effect where
 
 deriving via FirstOrder (Reader r) instance EnvFunctor (Reader r)
 
-runReader1 :: (Monad m, PromptBase m es, EnvFunctors es, EnvFunctors (DropToPromptBase es)) => EffT (Reader Int :+ es) m a -> EffT es m a
+runReader1 :: (Monad m, EnvFunctors es) => EffT (Reader Int :+ es) m a -> EffT es m a
 runReader1 = interpret \Ask -> pure 1
 
-runReader2 :: (Monad m, PromptBase m es, EnvFunctors es, EnvFunctors (DropToPromptBase es)) => EffT (Reader Int :+ es) m a -> EffT es m a
+runReader2 :: (Monad m, EnvFunctors es) => EffT (Reader Int :+ es) m a -> EffT es m a
 runReader2 = interpret \Ask -> pure 2
 
 data Evil :: Effect where
