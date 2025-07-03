@@ -34,41 +34,38 @@ type Effect = Type -> Type
 infixr 6 :+
 infixr 6 :/
 
-type data Frames = Effect :+ Frames | Type :/ Frames | Nil
+type e :+ es = E e : es
+type e :/ es = P e : es
 
 type data Frame = E Effect | P Type
-
-type family ConsFrame e = r | r -> e where
-    ConsFrame (E e) = (:+) e
-    ConsFrame (P ans) = (:/) ans
 
 type family Prompts m es where
     Prompts m (_ :+ es) = Prompts m es
     Prompts m (ans :/ es) = Prompt ans (Handlers m es) : Prompts m (DropToPromptBase es)
-    Prompts _ Nil = '[]
+    Prompts _ '[] = '[]
 
 type family Effects es where
     Effects (e :+ es) = e : Effects es
     Effects (_ :/ es) = Effects es
-    Effects Nil = '[]
+    Effects '[] = '[]
 
 type family FrameList es where
     FrameList (e :+ es) = E e : FrameList es
     FrameList (ans :/ es) = P ans : FrameList es
-    FrameList Nil = '[]
+    FrameList '[] = '[]
 
 -- | A effect handler.
-data Handler (m :: Type -> Type) (e :: Effect) (u :: Frames)
+data Handler (m :: Type -> Type) (e :: Effect) (u :: [Frame])
     = Handler
     { handler :: forall x. e x -> EffCtlT (Prompts m u) u m x
     , envOnHandler :: Handlers m u
     }
 
 -- | Vector of handlers.
-data Handlers (m :: Type -> Type) (es :: Frames) where
+data Handlers (m :: Type -> Type) (es :: [Frame]) where
     ConsHandler :: Handler m e (DropToPromptBase es) -> Handlers m es -> Handlers m (e :+ es)
     ConsPrompt :: Handlers m es -> Handlers m (ans :/ es)
-    Nil :: Handlers m Nil
+    Nil :: Handlers m '[]
 
 -- | An effect monad built on top of a multi-prompt/control monad.
 newtype EffT es m a = EffT {unEffT :: CtlT (Prompts m (DropToPromptBase es)) (Handlers m es) m a}
@@ -77,11 +74,11 @@ newtype EffT es m a = EffT {unEffT :: CtlT (Prompts m (DropToPromptBase es)) (Ha
 newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Handlers m es) m a}
     deriving (Functor, Applicative, Monad)
 
-(!:) :: Handler m e (DropToPromptBase es) -> Handlers m es -> Handlers m (ConsFrame (E e) es)
+(!:) :: Handler m e (DropToPromptBase es) -> Handlers m es -> Handlers m (e :+ es)
 (!:) = ConsHandler
 
 class IsFrame e where
-    dropHandler :: (Monad m) => Handlers m (ConsFrame e es) -> Handlers m es
+    dropHandler :: (Monad m) => Handlers m (e : es) -> Handlers m es
 
 instance IsFrame (E e) where
     dropHandler (ConsHandler _ hs) = hs
@@ -94,7 +91,7 @@ type family a == b where
     _ == _ = 'False
 
 -- | Type-level search over elements in a vector.
-class (Monad m) => Elem e (es :: Frames) m u | e es -> u where
+class (Monad m) => Elem e (es :: [Frame]) m u | e es -> u where
     membership :: Membership e es m u
 
 data Membership e es m u = Membership
@@ -147,7 +144,7 @@ send i e = EffT . unEffCtlT $ sendCtl (promptEvidence i) i e
 type family DropToPromptBase es where
     DropToPromptBase (_ :+ es) = DropToPromptBase es
     DropToPromptBase (ans :/ es) = ans :/ es
-    DropToPromptBase Nil = Nil
+    DropToPromptBase '[] = '[]
 
 class PromptBase m es where
     promptBaseEquality :: Prompts m es :~: Prompts m (DropToPromptBase es)
@@ -167,7 +164,7 @@ instance PromptBase m (ans :/ es) where
     dropHandlersToPromptBase = id
     extendPromptBase _ = id
 
-instance PromptBase m Nil where
+instance PromptBase m '[] where
     promptBaseEquality = Refl
     dropHandlersToPromptBase = id
     extendPromptBase _ = id
@@ -213,10 +210,10 @@ control ::
     EffT es m a
 control i f = EffT $ C.control i \k -> unEffT $ f $ EffT . k
 
-runPure :: EffT Nil Identity a -> a
+runPure :: EffT '[] Identity a -> a
 runPure = C.runPure Nil . unEffT
 
-runEffT :: (Functor f) => EffT Nil f a -> f a
+runEffT :: (Functor f) => EffT '[] f a -> f a
 runEffT = runCtlT Nil . unEffT
 
 data Throw e :: Effect where
