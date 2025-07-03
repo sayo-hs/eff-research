@@ -44,11 +44,6 @@ type family Prompts m es where
     Prompts m (ans :/ es) = Prompt ans (Handlers m es) : Prompts m (DropToPromptBase es)
     Prompts _ '[] = '[]
 
-type family Effects es where
-    Effects (e :+ es) = e : Effects es
-    Effects (_ :/ es) = Effects es
-    Effects '[] = '[]
-
 type family FrameList es where
     FrameList (e :+ es) = E e : FrameList es
     FrameList (ans :/ es) = P ans : FrameList es
@@ -85,10 +80,6 @@ instance IsFrame (E e) where
 
 instance IsFrame (P ans) where
     dropHandler (ConsPrompt hs) = hs
-
-type family a == b where
-    a == a = 'True
-    _ == _ = 'False
 
 -- | Type-level search over elements in a vector.
 class (Monad m) => Elem e (es :: [Frame]) m u | e es -> u where
