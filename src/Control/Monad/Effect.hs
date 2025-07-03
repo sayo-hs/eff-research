@@ -29,7 +29,7 @@ import Data.Coerce (Coercible, coerce)
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
 
-type Effect = [Frame] -> Type -> Type
+type Effect = (Type -> Type) -> Type -> Type
 
 infixr 6 :+
 infixr 6 :/
@@ -54,7 +54,7 @@ newtype Env m es = Env {unEnv :: Handlers m es es}
 -- | A effect handler.
 data Handler (m :: Type -> Type) (w :: [Frame]) (e :: Effect) (u :: [Frame])
     = Handler
-    { handler :: forall x. e w x -> EffCtlT (Prompts m u) u m x
+    { handler :: forall x. e (EffCtlT (Prompts m u) w m) x -> EffCtlT (Prompts m u) u m x
     , envOnHandler :: Handlers m w u
     }
 
@@ -72,7 +72,9 @@ newtype EffCtlT ps es m a = EffCtlT {unEffCtlT :: CtlT ps (Env m es) m a}
     deriving (Functor, Applicative, Monad)
 
 class EnvFunctor (e :: Effect) where
-    cmapEnv :: (Env m es -> Env m es') -> e es' a -> e es a
+    cmapEnv :: (Env m es -> Env m es') -> e (EffCtlT ps es' m) a -> e (EffCtlT ps es m) a
+    fromCtlH :: e (EffCtlT (Prompts m es) es m) a -> e (EffT es m) a
+    toCtlH :: e (EffT es m) a -> e (EffCtlT (Prompts m es) es m) a
 
 class EnvFunctors es where
     mapHandlers :: (Env m w -> Env m w') -> Handlers m w es -> Handlers m w' es
@@ -141,10 +143,10 @@ instance (Elem e es m u) => Elem e (ans :/ es) m u where
 
 sendCtl ::
     forall e ps es m u a.
-    (Monad m, EnvFunctors u) =>
+    (Monad m, EnvFunctors u, EnvFunctors es) =>
     Sub (Prompts m u) ps ->
     Membership e es m u ->
-    e es a ->
+    e (EffCtlT (Prompts m u) es m) a ->
     EffCtlT ps es m a
 sendCtl sub i e =
     EffCtlT $ CtlT $ FreerT $ ReaderT \r@(Env hs) ->
@@ -152,20 +154,23 @@ sendCtl sub i e =
          in (`runReaderT` r)
                 . runFreerT
                 . unCtlT
-                . under sub (Env . mapHandlers (mapEnv $ dropUnder i) . envOnHandler . getHandler i . unEnv) (Env $ mapHandlers (mapEnv $ dropUnder i) r')
+                . under
+                    sub
+                    (Env . envOnHandler . getHandler i . mapHandlers (mapEnv $ dropUnder i) . unEnv)
+                    (Env $ mapHandlers (mapEnv $ dropUnder i) r')
                 . unEffCtlT
                 $ h e
 
-send :: forall e es m u a. (Monad m, EnvFunctors u) => Membership e es m u -> e es a -> EffT es m a
-send i e = EffT . unEffCtlT $ sendCtl (promptEvidence i) i e
+send :: forall e es m u a. (Monad m, EnvFunctors u, EnvFunctor e, EnvFunctors es) => Membership e es m u -> e (EffT u m) a -> EffT es m a
+send i e = EffT . unEffCtlT $ sendCtl (promptEvidence i) i (cmapEnv (mapEnv $ dropUnder i) $ toCtlH e)
 
 interpret ::
     (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (forall x. e es x -> EffT es m x) ->
+    (forall x. e (EffT es m) x -> EffT es m x) ->
     EffT (e :+ es) m a ->
     EffT es m a
 interpret f (EffT m) =
-    EffT $ cmapCtlT (\r -> Handler (EffCtlT . unEffT . f) (unEnv r) !: r) m
+    EffT $ cmapCtlT (\r -> Handler (EffCtlT . unEffT . f . fromCtlH) (unEnv r) !: r) m
 
 prompt :: (Monad m, EnvFunctors es) => EffT (a :/ es) m a -> EffT es m a
 prompt (EffT m) = EffT $ C.prompt (mapEnv ConsPrompt) $ const m
@@ -174,7 +179,7 @@ interpretBy ::
     forall e a b es m.
     (Monad m, EnvFunctor e, EnvFunctors es) =>
     (a -> EffT es m b) ->
-    (forall x. e (b :/ es) x -> (x -> EffT es m b) -> EffT es m b) ->
+    (forall x. e (EffT (b :/ es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
     EffT (e :+ b :/ es) m a ->
     EffT es m b
 interpretBy ret hdl m =
@@ -213,13 +218,15 @@ newtype FirstOrder (e :: Effect) es a = FirstOrder (e es a)
 
 instance (forall es es' x. Coercible (e es x) (e es' x)) => EnvFunctor (FirstOrder e) where
     cmapEnv _ = coerce
+    fromCtlH = coerce
+    toCtlH = coerce
 
 deriving via FirstOrder (Throw e) instance EnvFunctor (Throw e)
 
 runExc :: (Monad m, EnvFunctors es) => EffT (Throw e :+ Either e a :/ es) m a -> EffT es m (Either e a)
 runExc = interpretBy (pure . Right) (\(Throw e) _ -> pure $ Left e)
 
-perform :: (Elem e es m u, EnvFunctors u) => e es a -> EffT es m a
+perform :: (Elem e es m u, EnvFunctors u, EnvFunctor e, EnvFunctors es) => e (EffT u m) a -> EffT es m a
 perform = send membership
 
 -- >>> test
