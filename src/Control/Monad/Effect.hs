@@ -14,13 +14,16 @@ module Control.Monad.Effect where
 
 import Control.Monad (join)
 import Control.Monad.MultiPrompt.Formal (
+    Control (..),
     CtlT (..),
     FreerT (FreerT),
     PromptFrame (..),
+    StackUnion (..),
     Sub,
     cmapCtlT,
     runCtlT,
     runFreerT,
+    transFreerT,
     under,
  )
 import Control.Monad.MultiPrompt.Formal qualified as C
@@ -215,20 +218,12 @@ runPure = C.runPure (Env Nil) . unEffT
 runEffT :: (Functor f) => EffT '[] f a -> f a
 runEffT = runCtlT (Env Nil) . unEffT
 
-data Throw e :: Effect where
-    Throw :: e -> Throw e es a
-
 newtype FirstOrder (e :: Effect) es a = FirstOrder (e es a)
 
 instance (forall es es' x. Coercible (e es x) (e es' x)) => EnvFunctor (FirstOrder e) where
     cmapEnv _ = coerce
     fromCtlH = coerce
     toCtlH = coerce
-
-deriving via FirstOrder (Throw e) instance EnvFunctor (Throw e)
-
-runExc :: (Monad m, EnvFunctors es) => EffT (Throw e :+ Either e a :/ es) m a -> EffT es m (Either e a)
-runExc = interpretBy (pure . Right) (\(Throw e) _ -> pure $ Left e)
 
 perform :: (Elem e es m u, EnvFunctors u, EnvFunctor e, EnvFunctors es) => e (EffT u m) a -> EffT es m a
 perform = send membership
@@ -279,3 +274,23 @@ evilTest = runPure do
         perform Evil
         perform $ Ask @Int
     runReader2 m
+
+data Exc e :: Effect where
+    Throw :: e -> Exc e m a
+    Catch :: m a -> (e -> m a) -> Exc e m a
+
+instance EnvFunctor (Exc e) where
+    cmapEnv f = \case
+        Throw e -> Throw e
+        Catch m hdl -> Catch (EffCtlT . cmapCtlT f . unEffCtlT $ m) (EffCtlT . cmapCtlT f . unEffCtlT . hdl)
+    fromCtlH = coerce
+    toCtlH = coerce
+
+runExc :: (Monad m, EnvFunctors es) => EffT (Exc e :+ Either e a :/ es) m a -> EffT es m (Either e a)
+runExc =
+    interpretBy
+        (pure . Right)
+        ( \case
+            Throw e -> \_ -> pure $ Left e
+            Catch m hdl -> runExc m >>= \case {}
+        )
