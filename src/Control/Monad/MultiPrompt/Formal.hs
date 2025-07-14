@@ -7,6 +7,8 @@
 {-# HLINT ignore "Avoid lambda" #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
+{-# HLINT ignore "Use >=>" #-}
+
 -- SPDX-License-Identifier: MPL-2.0
 
 {- |
@@ -18,9 +20,9 @@ A fully type-safe multi-prompt/control monad, inspired by [speff](https://github
 -}
 module Control.Monad.MultiPrompt.Formal where
 
-import Control.Monad (ap)
+import Control.Monad.Trans.Freer
 import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
-import Data.FTCQueue (FTCQueue (..), ViewL (TOne, (:|)), tsingleton, tviewl, (><), (|>))
+import Data.FTCQueue (tsingleton)
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity, runIdentity)
 import Data.Kind (Type)
@@ -100,63 +102,6 @@ instance '[] < xs where
 
 type data PromptFrame = Prompt Type Type
 
--- | The base functor for a freer monad.
-data FreerF f a g
-    = Pure a
-    | forall x. Freer (f x) (FTCQueue g x a)
-
--- | The freer monad transformer for a type constructor @f@
-newtype FreerT f m a = FreerT {runFreerT :: m (FreerF f a (FreerT f m))}
-
-instance (Applicative g) => Functor (FreerT f g) where
-    fmap f (FreerT m) =
-        FreerT $
-            m <&> \case
-                Pure x -> Pure $ f x
-                Freer g q -> Freer g $ q |> (FreerT . pure . Pure . f)
-
-instance (Monad m) => Applicative (FreerT f m) where
-    pure = FreerT . pure . Pure
-    (<*>) = ap
-
-instance (Monad m) => Monad (FreerT f m) where
-    FreerT m >>= f =
-        FreerT $
-            m >>= \case
-                Pure x -> runFreerT $ f x
-                Freer g k -> pure $ Freer g $ k |> f
-
-instance (MonadIO m) => MonadIO (FreerT f m) where
-    liftIO m = FreerT $ liftIO $ Pure <$> m
-
-liftF :: (Applicative g) => f a -> FreerT f g a
-liftF f = FreerT $ pure $ Freer f (tsingleton $ FreerT . pure . Pure)
-
-transFreerT :: (Monad m) => (forall x. f x -> g x) -> FreerT f m a -> FreerT g m a
-transFreerT phi (FreerT m) =
-    FreerT $
-        m <&> \case
-            Pure x -> Pure x
-            Freer f q -> Freer (phi f) (tsingleton $ transFreerT phi . qApp q)
-
-hoistFreerT :: (Monad m) => (forall x. m x -> n x) -> FreerT f m a -> FreerT f n a
-hoistFreerT phi (FreerT m) =
-    FreerT . phi $
-        m <&> \case
-            Pure x -> Pure x
-            Freer f q -> Freer f (tsingleton $ hoistFreerT phi . qApp q)
-
-qApp :: (Monad m) => FTCQueue (FreerT f m) a b -> a -> FreerT f m b
-qApp q x = FreerT case tviewl q of
-    TOne k -> runFreerT $ k x
-    k :| t ->
-        runFreerT (k x) >>= \case
-            Pure y -> runFreerT $ qApp t y
-            Freer f q' -> pure $ Freer f $ q' >< t
-
-liftFreerT :: (Functor g) => g a -> FreerT f g a
-liftFreerT a = FreerT $ Pure <$> a
-
 {- | A type-safe multi-prompt/control monad transformer with reader environment.
 
     @ps@: A list of the current prompt stack frames.
@@ -201,14 +146,14 @@ prompt ::
     forall r r' ps m ans.
     (Monad m) =>
     (r' -> r) ->
-    (Proxy ps -> CtlT (Prompt ans r' : ps) r m ans) ->
+    CtlT (Prompt ans r' : ps) r m ans ->
     CtlT ps r' m ans
 prompt f m =
     CtlT $ FreerT $ ReaderT \r ->
-        runReaderT (runFreerT $ unCtlT $ m Proxy) (f r) >>= \case
+        runReaderT (runFreerT $ unCtlT m) (f r) >>= \case
             Pure x -> pure $ Pure x
             Freer ctls q ->
-                let k x = prompt f \_ -> CtlT $ qApp q x
+                let k x = prompt f $ CtlT $ qApp q x
                  in case ctls of
                         Here (Control ctl) -> runReaderT (runFreerT $ unCtlT $ ctl k) r
                         There u -> pure $ Freer u (tsingleton $ unCtlT . k)
@@ -253,7 +198,7 @@ runCoroutine ::
     (Monad m) =>
     (Proxy ps -> CtlT (Prompt (Status a b ps v m r) v : ps) v m r) ->
     CtlT ps v m (Status a b ps v m r)
-runCoroutine f = prompt id \p -> Done <$> f p
+runCoroutine f = prompt id $ Done <$> f Proxy
 
 test :: IO ()
 test = runCtlT () do
