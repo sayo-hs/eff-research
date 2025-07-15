@@ -49,56 +49,30 @@ mapStackUnion f = \case
 forStackUnion :: StackUnion xs h a -> (forall x r. h x r a -> i x r a) -> StackUnion xs i a
 forStackUnion u f = mapStackUnion f u
 
-type Elem u xs x = (Member u xs x, u < xs)
-
-class Member r xs x | r xs -> x where
-    membership :: Membership r xs x
-
-data Membership (r :: [k]) (xs :: [k]) (x :: k)
-    = Membership
-    { inject :: forall l h (a :: l). h x r a -> StackUnion xs h a
-    , project :: forall l h (a :: l). StackUnion xs h a -> Maybe (h x r a)
-    }
-
-instance Member xs (x : xs) x where
-    membership =
-        Membership
-            Here
-            \case
-                Here x -> Just x
-                There _ -> Nothing
-
-member :: (Member r xs x) => Proxy r -> Membership r xs x
-member _ = membership
-
-instance {-# OVERLAPPABLE #-} (Member r xs x) => Member r (x' : xs) x where
-    membership =
-        Membership
-            (There . inject membership)
-            \case
-                Here _ -> Nothing
-                There xs -> project membership xs
-
 infix 4 <
 class u < xs where
     sub :: Proxy u -> Sub u xs
 
-newtype Sub (r :: [k]) (xs :: [k])
+data Sub (u :: [k]) (xs :: [k])
     = Sub
-    { embed ::
+    { weaken ::
         forall l h (a :: l).
-        StackUnion r h a ->
+        StackUnion u h a ->
         StackUnion xs h a
+    , strengthen :: forall l h (a :: l). StackUnion xs h a -> Maybe (StackUnion u h a)
     }
 
-instance xs < x : xs where
-    sub _ = Sub There
+instance {-# INCOHERENT #-} (u < xs) => u < x : xs where
+    sub p =
+        Sub
+            { weaken = There . weaken (sub p)
+            , strengthen = \case
+                Here _ -> Nothing
+                There u -> strengthen (sub p) u
+            }
 
-instance {-# OVERLAPPABLE #-} (r < xs) => r < x : xs where
-    sub _ = Sub $ There . embed (sub Proxy)
-
-instance {-# INCOHERENT #-} xs < xs where
-    sub _ = Sub id
+instance xs < xs where
+    sub _ = Sub{weaken = id, strengthen = Just}
 
 type data PromptFrame = Prompt (Type -> Type)
 
@@ -114,7 +88,7 @@ newtype CtlT (ps :: [PromptFrame]) m a = CtlT {unCtlT :: FreerT (StackUnion ps (
     deriving (Functor, Applicative, Monad, MonadIO)
 
 data Control (m :: Type -> Type) (p :: PromptFrame) (u :: [PromptFrame]) (a :: Type) where
-    Control :: (forall w x. Sub (Prompt f : u) w -> Membership u w (Prompt f) -> (a -> CtlT w m (f x)) -> CtlT w m (f x)) -> Control m (Prompt f) u a
+    Control :: (forall w x. Sub (Prompt f : u) w -> (a -> CtlT w m (f x)) -> CtlT w m (f x)) -> Control m (Prompt f) u a
     Control0 :: (forall x. (a -> CtlT u m (f x)) -> CtlT u m (f x)) -> Control m (Prompt f) u a
 
 runCtlT :: (Functor f) => CtlT '[] f a -> f a
@@ -152,7 +126,7 @@ prompt m =
             Freer ctls q ->
                 let k x = CtlT $ qApp q x
                  in case ctls of
-                        Here (Control ctl) -> runFreerT $ unCtlT $ prompt $ ctl (Sub id) membership k
+                        Here (Control ctl) -> runFreerT $ unCtlT $ prompt $ ctl (sub Proxy) k
                         Here (Control0 ctl) -> runFreerT $ unCtlT $ ctl $ prompt . k
                         There u -> pure $ Freer u (tsingleton $ unCtlT . prompt . k)
 
@@ -160,62 +134,61 @@ delimit ::
     forall f u ps m a.
     (Monad m) =>
     Sub (Prompt f : u) ps ->
-    Membership u ps (Prompt f) ->
     CtlT ps m (f a) ->
     CtlT ps m (f a)
-delimit s i m =
+delimit i m =
     CtlT . FreerT $
         runFreerT (unCtlT m) >>= \case
             Pure x -> pure $ Pure x
             Freer ctls q ->
-                let k x = delimit s i $ CtlT $ qApp q x
-                 in case project i ctls of
-                        Just (Control ctl) -> runFreerT . unCtlT $ ctl s i k
+                let k x = delimit i $ CtlT $ qApp q x
+                 in case strengthen i ctls of
+                        Just (Here (Control ctl)) -> runFreerT . unCtlT $ ctl i k
                         _ -> pure $ Freer ctls q
 
 control ::
     (Applicative m) =>
-    Membership u ps (Prompt f) ->
-    (forall w x. Sub (Prompt f : u) w -> Membership u w (Prompt f) -> (a -> CtlT w m (f x)) -> CtlT w m (f x)) ->
+    Sub (Prompt f : u) ps ->
+    (forall w x. Sub (Prompt f : u) w -> (a -> CtlT w m (f x)) -> CtlT w m (f x)) ->
     CtlT ps m a
-control i f = CtlT . liftF . inject i $ Control f
+control i f = CtlT . liftF . weaken i $ Here $ Control f
 
 control0 ::
     (Applicative m) =>
-    Membership u ps (Prompt f) ->
+    Sub (Prompt f : u) ps ->
     (forall x. (a -> CtlT u m (f x)) -> CtlT u m (f x)) ->
     CtlT ps m a
-control0 i f = CtlT . liftF . inject i $ Control0 f
+control0 i f = CtlT . liftF . weaken i $ Here $ Control0 f
 
-abort :: (Monad m) => Membership u ps (Prompt f) -> (forall x. f x) -> CtlT ps m a
-abort i ans = control i \_ _ _ -> pure ans
+abort :: (Monad m) => Sub (Prompt f : u) ps -> (forall x. f x) -> CtlT ps m a
+abort i ans = control i \_ _ -> pure ans
 
 under :: (Monad m) => Sub u ps -> CtlT u m a -> CtlT ps m a
-under s (CtlT (FreerT m)) =
+under i (CtlT (FreerT m)) =
     CtlT $
         FreerT $
             m <&> \case
                 Pure x -> Pure x
-                Freer u q -> Freer (embed s u) (tsingleton $ unCtlT . underk s (CtlT . qApp q))
+                Freer u q -> Freer (weaken i u) (tsingleton $ unCtlT . underk i (CtlT . qApp q))
 
 underk ::
     (Monad m) =>
     Sub u ps ->
     (b -> CtlT u m a) ->
     (b -> CtlT ps m a)
-underk s k x = CtlT $ FreerT $ runFreerT $ unCtlT $ under s (k x)
+underk i k x = CtlT $ FreerT $ runFreerT $ unCtlT $ under i (k x)
 
 raise :: (Monad m) => CtlT ps m a -> CtlT (p : ps) m a
 raise = CtlT . transFreerT There . unCtlT
 
 data Status a b ps m r = Done r | Continue a (b -> CtlT ps m (Status a b ps m r))
 
-yield :: (Monad m, Member u ps (Prompt (Status a b u m))) => Proxy u -> a -> CtlT ps m b
-yield p x = control0 (member p) \k -> pure $ Continue x k
+yield :: (Monad m) => Sub (Prompt (Status a b u m) : u) ps -> a -> CtlT ps m b
+yield i x = control0 i \k -> pure $ Continue x k
 
 runCoroutine ::
     (Monad m) =>
-    (Proxy ps -> CtlT (Prompt (Status a b ps m) : ps) m r) ->
+    (Proxy (Prompt (Status a b ps m) : ps) -> CtlT (Prompt (Status a b ps m) : ps) m r) ->
     CtlT ps m (Status a b ps m r)
 runCoroutine f = prompt $ Done <$> f Proxy
 
@@ -223,7 +196,7 @@ test :: IO ()
 test = runCtlT do
     s <- runCoroutine \c -> do
         liftIO $ putStrLn "a"
-        i <- yield c 0
+        i <- yield (sub c) 0
         liftIO $ print i
     case s of
         Continue (x :: Int) resume -> do
@@ -233,18 +206,18 @@ test = runCtlT do
 
 runExc ::
     (Monad m) =>
-    (Proxy ps -> CtlT (Prompt (Either e) : ps) m a) ->
+    (Proxy (Prompt (Either e) : ps) -> CtlT (Prompt (Either e) : ps) m a) ->
     CtlT ps m (Either e a)
 runExc f = prompt $ Right <$> f Proxy
 
-throw :: (Monad m, Member u ps (Prompt (Either e))) => Proxy u -> e -> CtlT ps m a
-throw p e = abort (member p) $ Left e
+throw :: (Monad m) => Sub (Prompt (Either e) : u) ps -> e -> CtlT ps m a
+throw i e = abort i $ Left e
 
-try :: (Monad m, Member u ps (Prompt (Either e))) => Sub (Prompt (Either e) : u) ps -> CtlT ps m a -> CtlT ps m (Either e a)
-try s m = delimit s (member Proxy) $ Right <$> m
+try :: (Monad m) => Sub (Prompt (Either e) : u) ps -> CtlT ps m a -> CtlT ps m (Either e a)
+try i m = delimit i $ Right <$> m
 
-catch :: (Monad m, Member u ps (Prompt (Either e))) => Sub (Prompt (Either e) : u) ps -> CtlT ps m a -> (e -> CtlT ps m a) -> CtlT ps m a
-catch s m hdl = try s m >>= either hdl pure
+catch :: (Monad m) => Sub (Prompt (Either e) : u) ps -> CtlT ps m a -> (e -> CtlT ps m a) -> CtlT ps m a
+catch i m hdl = try i m >>= either hdl pure
 
 -- >>> test2
 -- Right 3
@@ -252,20 +225,20 @@ catch s m hdl = try s m >>= either hdl pure
 test2 :: Either String Int
 test2 = runPure $ runExc \exc -> do
     catch
-        (Sub id)
-        (throw exc "abc")
+        (sub exc)
+        (throw (sub exc) "abc")
         \e -> pure $ length e
 
-runNonDet :: (Monad m) => (Proxy ps -> CtlT (Prompt [] : ps) m a) -> CtlT ps m [a]
+runNonDet :: (Monad m) => (Proxy (Prompt [] : ps) -> CtlT (Prompt [] : ps) m a) -> CtlT ps m [a]
 runNonDet f = prompt $ singleton <$> f Proxy
 
-empty :: (Monad m, Member u ps (Prompt [])) => Proxy u -> CtlT ps m a
-empty p = abort (member p) []
+empty :: (Monad m) => Sub (Prompt [] : u) ps -> CtlT ps m a
+empty i = abort i []
 
-choice :: forall m u ps a. (Monad m, Member u ps (Prompt [])) => Sub (Prompt [] : u) ps -> [CtlT ps m a] -> CtlT ps m a
-choice s ms = do
-    xs <- concat <$> mapM (delimit s membership . fmap singleton) ms
-    control (membership @u) \s' i' k -> concat <$> mapM (delimit s' i' . k) xs
+choice :: forall m u ps a. (Monad m) => Sub (Prompt [] : u) ps -> [CtlT ps m a] -> CtlT ps m a
+choice i ms = do
+    xs <- concat <$> mapM (delimit i . fmap singleton) ms
+    control i \i' k -> concat <$> mapM (delimit i' . k) xs
 
 -- >>> test3
 -- [0,4]
@@ -273,8 +246,8 @@ choice s ms = do
 test3 :: [Int]
 test3 = runPure $ runNonDet \nd -> do
     x <- runExc \exc -> do
-        x :: Int <- choice (Sub There) [pure 0, pure 1]
+        x :: Int <- choice (sub nd) [pure 0, pure 1]
         if x == 1
-            then throw exc "test"
+            then throw (sub exc) "test"
             else pure x
     pure $ either length id x
