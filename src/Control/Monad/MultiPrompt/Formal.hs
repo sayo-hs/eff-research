@@ -1,13 +1,6 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE FunctionalDependencies #-}
-{-# HLINT ignore "Use fmap" #-}
 {-# LANGUAGE TypeData #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UndecidableInstances #-}
 {-# HLINT ignore "Avoid lambda" #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
-
-{-# HLINT ignore "Use >=>" #-}
 
 -- SPDX-License-Identifier: MPL-2.0
 
@@ -16,11 +9,11 @@ Copyright   :  (c) 2025 Sayo contributors
 License     :  MPL-2.0 (see the LICENSE file)
 Maintainer  :  ymdfield@outlook.jp
 
-A fully type-safe multi-prompt/control monad, inspired by [speff](https://github.com/re-xyr/speff).
+A fully type-safe multi-prompt/control monad, inspired by [speff](https://github.com/re-xyr/speff) and [turbolift](https://marcinzh.github.io/turbolift/).
 -}
 module Control.Monad.MultiPrompt.Formal where
 
-import Control.Monad.Trans.Freer
+import Control.Monad.Trans.Freer (FreerF (Freer, Pure), FreerT (..), liftF, qApp, transFreerT)
 import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.FTCQueue (tsingleton)
 import Data.Functor ((<&>))
@@ -55,10 +48,7 @@ class u < xs where
 
 data Sub (u :: [k]) (xs :: [k])
     = Sub
-    { weaken ::
-        forall l h (a :: l).
-        StackUnion u h a ->
-        StackUnion xs h a
+    { weaken :: forall l h (a :: l). StackUnion u h a -> StackUnion xs h a
     , strengthen :: forall l h (a :: l). StackUnion xs h a -> Maybe (StackUnion u h a)
     }
 
@@ -126,7 +116,7 @@ prompt m =
             Freer ctls q ->
                 let k x = CtlT $ qApp q x
                  in case ctls of
-                        Here (Control ctl) -> runFreerT $ unCtlT $ prompt $ ctl (sub Proxy) k
+                        Here (Control ctl) -> runFreerT $ unCtlT $ prompt $ ctl (Sub id Just) k
                         Here (Control0 ctl) -> runFreerT $ unCtlT $ ctl $ prompt . k
                         There u -> pure $ Freer u (tsingleton $ unCtlT . prompt . k)
 
