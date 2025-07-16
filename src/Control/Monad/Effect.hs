@@ -16,21 +16,22 @@ import Control.Monad (join)
 import Control.Monad.MultiPrompt.Formal (
     Control (..),
     CtlT (..),
-    FreerT (FreerT),
     PromptFrame (..),
     StackUnion (..),
     Sub,
     cmapCtlT,
     runCtlT,
-    runFreerT,
-    transFreerT,
     under,
  )
 import Control.Monad.MultiPrompt.Formal qualified as C
+import Control.Monad.Trans.Freer
 import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
 import Data.Coerce (Coercible, coerce)
+import Data.Function (fix)
+import Data.Functor.Const (Const (Const), getConst)
 import Data.Functor.Identity (Identity)
 import Data.Kind (Type)
+import Data.Proxy (Proxy (Proxy))
 
 type Effect = (Type -> Type) -> Type -> Type
 
@@ -40,11 +41,11 @@ infixr 6 :/
 type e :+ es = E e : es
 type e :/ es = P e : es
 
-type data Frame = E Effect | P Type
+type data Frame = E Effect | P (Type -> Type)
 
 type family Prompts m es where
     Prompts m (_ :+ es) = Prompts m es
-    Prompts m (ans :/ es) = Prompt ans (Env m es) : Prompts m es
+    Prompts m (f :/ es) = Prompt f (Env m es) : Prompts m es
     Prompts _ '[] = '[]
 
 type family FrameList es where
@@ -110,7 +111,7 @@ class IsFrame e where
 instance IsFrame (E e) where
     dropHandler (ConsHandler _ hs) = hs
 
-instance IsFrame (P ans) where
+instance IsFrame (P f) where
     dropHandler (ConsPrompt hs) = hs
 
 -- | Type-level search over elements in a vector.
@@ -127,7 +128,7 @@ instance (Monad m) => Elem e (e :+ es) m es where
     membership =
         Membership
             { getHandler = \(ConsHandler h _) -> h
-            , promptEvidence = C.sub
+            , promptEvidence = C.sub Proxy
             , dropUnder = dropHandler
             }
 
@@ -140,11 +141,15 @@ instance {-# OVERLAPPABLE #-} (Elem e es m u) => Elem e (e' :+ es) m u where
                 , dropUnder = dropUnder ms . dropHandler
                 }
 
-instance (Elem e es m u) => Elem e (ans :/ es) m u where
+instance (Elem e es m u) => Elem e (f :/ es) m u where
     membership =
         Membership
             { getHandler = \(ConsPrompt hs) -> getHandler membership hs
-            , promptEvidence = C.Sub $ C.There . C.embed (promptEvidence $ membership @e @es @m @u)
+            , promptEvidence =
+                let ev = promptEvidence $ membership @e @es @m @u
+                 in C.Sub (C.There . C.weaken ev) \case
+                        C.Here _ -> Nothing
+                        C.There u -> C.strengthen ev u
             , dropUnder = dropUnder (membership @e @es @m @u) . dropHandler
             }
 
@@ -179,18 +184,18 @@ interpret ::
 interpret f (EffT m) =
     EffT $ cmapCtlT (\r -> (EffCtlT . unEffT . f . fromCtlH) !: r) m
 
-prompt :: (Monad m, EnvFunctors es) => EffT (a :/ es) m a -> EffT es m a
-prompt (EffT m) = EffT $ C.prompt (mapEnv ConsPrompt) $ const m
+prompt :: (Monad m, EnvFunctors es) => EffT (f :/ es) m (f a) -> EffT es m (f a)
+prompt (EffT m) = EffT $ C.prompt (mapEnv ConsPrompt) m
 
 interpretBy ::
-    forall e a b es m.
+    forall e a f es m.
     (Monad m, EnvFunctor e, EnvFunctors es) =>
-    (a -> EffT es m b) ->
-    (forall x. e (EffT (e :+ b :/ es) m) x -> (x -> EffT es m b) -> EffT es m b) ->
-    EffT (e :+ b :/ es) m a ->
-    EffT es m b
+    (a -> EffT es m (f a)) ->
+    (forall x y. e (EffT (e :+ f :/ es) m) x -> (x -> EffT es m (f y)) -> EffT es m (f y)) ->
+    EffT (e :+ f :/ es) m a ->
+    EffT es m (f a)
 interpretBy ret hdl m =
-    prompt $ interpret (\e -> control C.membership \k -> hdl e k) (m >>= raiseEP . ret)
+    prompt $ interpret (\e -> control0 (C.Sub id Just) \k -> hdl e k) (m >>= raiseEP . ret)
 
 raise :: (Monad m, EnvFunctors es) => EffT es m a -> EffT (e :+ es) m a
 raise = EffT . cmapCtlT (mapEnv dropHandler) . unEffT
@@ -201,16 +206,15 @@ raisePrompt = EffT . cmapCtlT (mapEnv dropHandler) . C.raise . unEffT
 raiseEP :: (Monad m, EnvFunctors es) => EffT es m a -> EffT (e :+ a' :/ es) m a
 raiseEP = EffT . cmapCtlT (mapEnv (dropHandler . dropHandler)) . C.raise . unEffT
 
-control ::
-    forall ans u es m a.
+control0 ::
+    forall f u es m a.
     (Monad m) =>
-    C.Membership
-        (Prompts m u)
-        (Prompts m es)
-        (Prompt ans (Env m u)) ->
-    ((a -> EffT u m ans) -> EffT u m ans) ->
+    C.Sub
+        (Prompts m (f :/ u))
+        (Prompts m es) ->
+    (forall x. (a -> EffT u m (f x)) -> EffT u m (f x)) ->
     EffT es m a
-control i f = EffT $ C.control i \k -> unEffT $ f $ EffT . k
+control0 i f = EffT $ C.control0 i \k -> unEffT $ f $ EffT . k
 
 runPure :: EffT '[] Identity a -> a
 runPure = C.runPure (Env Nil) . unEffT
@@ -261,8 +265,8 @@ data Evil :: Effect where
 
 deriving via FirstOrder Evil instance EnvFunctor Evil
 
-runEvil :: (Monad m, EnvFunctors es) => EffT (Evil :+ EffT es m a :/ es) m a -> EffT es m (EffT es m a)
-runEvil = interpretBy (pure . pure) \Evil k -> pure $ join $ k ()
+runEvil :: (Monad m, EnvFunctors es) => EffT (Evil :+ Const (EffT es m a) :/ es) m a -> EffT es m (EffT es m a)
+runEvil = fmap getConst . interpretBy (pure . Const . pure) \Evil k -> pure $ Const $ getConst =<< k ()
 
 -- >>> evilTest
 -- 2
@@ -286,11 +290,27 @@ instance EnvFunctor (Exc e) where
     fromCtlH = coerce
     toCtlH = coerce
 
-runExc :: (Monad m, EnvFunctors es) => EffT (Exc e :+ Either e a :/ es) m a -> EffT es m (Either e a)
+runExc :: (Monad m, EnvFunctors es) => EffT (Exc e :+ Either e :/ es) m a -> EffT es m (Either e a)
 runExc =
     interpretBy
         (pure . Right)
         ( \case
             Throw e -> \_ -> pure $ Left e
-            Catch m hdl -> runExc m >>= \case {}
+            Catch m hdl -> \k -> do
+                x <-
+                    flip fix m \f n ->
+                        runExc n >>= \case
+                            Left e -> f $ hdl e
+                            Right x -> pure x
+                k x
         )
+
+-- >>> excTest
+-- Left "test"
+
+excTest :: Either String Int
+excTest = runPure $ runExc do
+    perform @(Exc String) $
+        Catch
+            (perform $ Throw "test")
+            undefined
