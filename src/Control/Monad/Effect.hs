@@ -6,6 +6,7 @@
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# HLINT ignore "Avoid lambda" #-}
+{-# HLINT ignore "Avoid lambda using `infix`" #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 -- SPDX-License-Identifier: MPL-2.0
@@ -191,10 +192,25 @@ interpretBy ::
     forall e a f es m.
     (Monad m, EnvFunctor e, EnvFunctors es) =>
     (a -> EffT es m (f a)) ->
-    (forall x y. e (EffT (e :+ f :/ es) m) x -> (x -> EffT es m (f y)) -> EffT es m (f y)) ->
+    ( forall w x y.
+      Sub (Prompts m (f :/ es)) w ->
+      e (EffT (e :+ f :/ es) m) x ->
+      (x -> EffCtlT w es m (f y)) ->
+      EffCtlT w es m (f y)
+    ) ->
     EffT (e :+ f :/ es) m a ->
     EffT es m (f a)
 interpretBy ret hdl m =
+    prompt $ interpret (\e -> control (C.Sub id Just) \s k -> hdl s e k) (m >>= raiseEP . ret)
+
+interpretBy0 ::
+    forall e a f es m.
+    (Monad m, EnvFunctor e, EnvFunctors es) =>
+    (a -> EffT es m (f a)) ->
+    (forall x y. e (EffT (e :+ f :/ es) m) x -> (x -> EffT es m (f y)) -> EffT es m (f y)) ->
+    EffT (e :+ f :/ es) m a ->
+    EffT es m (f a)
+interpretBy0 ret hdl m =
     prompt $ interpret (\e -> control0 (C.Sub id Just) \k -> hdl e k) (m >>= raiseEP . ret)
 
 raise :: (Monad m, EnvFunctors es) => EffT es m a -> EffT (e :+ es) m a
@@ -205,6 +221,20 @@ raisePrompt = EffT . cmapCtlT (mapEnv dropHandler) . C.raise . unEffT
 
 raiseEP :: (Monad m, EnvFunctors es) => EffT es m a -> EffT (e :+ a' :/ es) m a
 raiseEP = EffT . cmapCtlT (mapEnv (dropHandler . dropHandler)) . C.raise . unEffT
+
+control ::
+    forall f u es m a.
+    (Monad m) =>
+    C.Sub
+        (Prompts m (f :/ u))
+        (Prompts m es) ->
+    ( forall w x.
+      Sub (Prompts m (f :/ u)) w ->
+      (a -> EffCtlT w u m (f x)) ->
+      EffCtlT w u m (f x)
+    ) ->
+    EffT es m a
+control i f = EffT $ C.control i \s k -> unEffCtlT $ f s $ EffCtlT . k
 
 control0 ::
     forall f u es m a.
@@ -266,7 +296,7 @@ data Evil :: Effect where
 deriving via FirstOrder Evil instance EnvFunctor Evil
 
 runEvil :: (Monad m, EnvFunctors es) => EffT (Evil :+ Const (EffT es m a) :/ es) m a -> EffT es m (EffT es m a)
-runEvil = fmap getConst . interpretBy (pure . Const . pure) \Evil k -> pure $ Const $ getConst =<< k ()
+runEvil = fmap getConst . interpretBy0 (pure . Const . pure) \Evil k -> pure $ Const $ getConst =<< k ()
 
 -- >>> evilTest
 -- 2
@@ -294,12 +324,12 @@ runExc :: (Monad m, EnvFunctors es) => EffT (Exc e :+ Either e :/ es) m a -> Eff
 runExc =
     interpretBy
         (pure . Right)
-        ( \case
+        ( \s -> \case
             Throw e -> \_ -> pure $ Left e
             Catch m hdl -> \k -> do
                 x <-
                     flip fix m \f n ->
-                        runExc n >>= \case
+                        undefined (runExc n) >>= \case
                             Left e -> f $ hdl e
                             Right x -> pure x
                 k x
