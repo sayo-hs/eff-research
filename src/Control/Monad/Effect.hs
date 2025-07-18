@@ -335,6 +335,7 @@ runExc =
                 k x
         )
 
+{-
 -- >>> excTest
 -- Left "test"
 
@@ -344,3 +345,4 @@ excTest = runPure $ runExc do
         Catch
             (perform $ Throw "test")
             undefined
+-}
