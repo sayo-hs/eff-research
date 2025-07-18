@@ -51,7 +51,7 @@ them in a formally first‑order shape. I call this technique **first‑order em
 and the code in this file is meant to demonstrate that clever trick.
 
 The `pull` function lets you emulate this behavior without breaking parametricity by taking a
-`membership` argument. By carrying that `membership` evidence inside the operation data when you
+membership argument. By carrying that membership evidence inside the operation data when you
 encode a higher‑order effect, the `pull` function is given proof that the effect indeed appears in
 the list. This novel technique makes it possible to implement Kyo's higher‑order‑effect handling
 strategy in Haskell as well.
