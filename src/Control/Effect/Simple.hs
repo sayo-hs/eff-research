@@ -61,10 +61,13 @@ module Control.Effect.Simple where
 import Control.Arrow (first)
 import Control.Monad ((>=>))
 import Control.Monad.Trans.Freer (FreerF (..), FreerT (FreerT), qApp, runFreerT, transFreerT)
+import Data.Coerce (coerce)
 import Data.FTCQueue (tsingleton)
+import Data.Functor (($>))
 import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
 import Data.List (singleton)
+import Data.Monoid (Sum (Sum))
 
 -- ====================================================================================================
 --  * Effect system implementation
@@ -78,7 +81,7 @@ type Eff es = FreerT (Union es App) Identity
 
 -------------------- ** Open union
 
--- | Generic open union
+-- | Generic open union.
 data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
     Here :: h x a -> Union (x : xs) h a
     There :: Union xs h a -> Union (x : xs) h a
@@ -89,18 +92,34 @@ data Membership h x xs = Membership
     , project :: forall a. Union xs h a -> Maybe (h x a)
     }
 
+{- |
+Constraint expressing that a slot is contained within an open union.
+@x@ ∈ @xs@.
+-}
 class x :> xs where
     membership :: Membership h x xs
 
-instance e :> (e : es) where
-    membership = Membership Here \case
-        Here x -> Just x
-        There _ -> Nothing
+-- | Case where the slot being searched for exists at the head of the list.
+instance x :> (x : es) where
+    membership = hereMembership
 
-instance {-# OVERLAPPABLE #-} (e :> es) => e :> (e' : es) where
-    membership = Membership (There . inject membership) \case
+{- |
+Case where the slot being searched for does not exist at the head of the list but exists further
+down. Delegates the slot search to the tail @xs@.
+-}
+instance {-# OVERLAPPABLE #-} (x :> xs) => x :> (x' : xs) where
+    membership = weakenMembership membership
+
+hereMembership :: Membership h x (x : xs)
+hereMembership = Membership Here \case
+    Here x -> Just x
+    There _ -> Nothing
+
+weakenMembership :: Membership h x xs -> Membership h x (x' : xs)
+weakenMembership i =
+    Membership (There . inject i) \case
         Here _ -> Nothing
-        There u -> project membership u
+        There u -> project i u
 
 -- | Helper type to specialize an open union for effect lists.
 newtype App f a = App {getApp :: f a}
@@ -126,6 +145,16 @@ interpret ret hdl (FreerT (Identity m)) =
              in case f of
                     Here e -> runIdentity . runFreerT $ hdl (getApp e) k
                     There u -> Freer u (tsingleton k)
+
+-- | A version of `interpret` that delegates interpretation to the new effect @e'@.
+reinterpret ::
+    -- | Value handler
+    (a -> Eff (e' : es) b) ->
+    -- | Effect handler
+    (forall x. e x -> (x -> Eff (e' : es) b) -> Eff (e' : es) b) ->
+    Eff (e : es) a ->
+    Eff (e' : es) b
+reinterpret ret hdl = interpret ret hdl . raiseUnder
 
 {- |
 A version of `interpret` in which the interpretation is not automatically recursive in the
@@ -167,9 +196,15 @@ rewrite i f = transFreerT \u -> case project i u of
     Just e -> inject i $ App $ f $ getApp e
     Nothing -> u
 
--- | Extend the effect list as a set (i.e. introduce a new effect to the front).
+-- | Extend the effect list as a set (introduce a new effect to the 1st slot).
 raise :: Eff es a -> Eff (e : es) a
 raise = transFreerT There
+
+-- | Extend the effect list as a set (insert a new effect to the 2nd slot).
+raiseUnder :: Eff (e1 : es) a -> Eff (e1 : e2 : es) a
+raiseUnder = transFreerT \case
+    Here e -> Here e
+    There u -> There $ There u
 
 -------------------- ** Performing effects
 
@@ -212,19 +247,40 @@ runPure (FreerT m) = case runIdentity m of
 --  * Definitions of various effects
 -- ====================================================================================================
 
+-------------------- ** State effect
+
+data State s :: Effect where
+    Get :: State s s
+    Put :: s -> State s ()
+
+get :: (State s :> es) => Eff es s
+get = perform Get
+
+put :: (State s :> es) => s -> Eff es ()
+put = perform . Put
+
+runState :: s -> Eff (State s : es) a -> Eff es a
+runState s = do
+    interpretShallow pure \case
+        Get -> \k -> runState s $ k s
+        Put s' -> \k -> runState s' $ k ()
+
 -------------------- ** Reader effect
 
 data Reader r :: Effect where
     Ask :: Reader r r
     Local :: Member (Reader r) es -> (r -> r) -> Eff es a -> Reader r (Eff es a)
 
+ask :: (Reader r :> es) => Eff es r
+ask = perform Ask
+
+local :: (Reader r :> es) => (r -> r) -> Eff es a -> Eff es a
+local f m = performH $ Local membership f m
+
 runReader :: r -> Eff (Reader r : es) a -> Eff es a
 runReader r = interpret pure \case
     Ask -> \k -> k r
     Local i f m -> \k -> k $ runReader (f r) (pull i m)
-
-local :: (Reader r :> es) => (r -> r) -> Eff es a -> Eff es a
-local f m = performH $ Local membership f m
 
 -------------------- ** Coroutine effect
 
@@ -232,6 +288,9 @@ data Yield i o :: Effect where
     Yield :: i -> Yield i o o
 
 data Status f i o a = Done a | Continue i (o -> f (Status f i o a))
+
+yield :: (Yield i o :> es) => i -> Eff es o
+yield = perform . Yield
 
 runCoroutine :: Eff (Yield i o : es) a -> Eff es (Status (Eff es) i o a)
 runCoroutine = interpret (pure . Done) \(Yield i) k -> pure $ Continue i k
@@ -241,6 +300,9 @@ runCoroutine = interpret (pure . Done) \(Yield i) k -> pure $ Continue i k
 data Except e :: Effect where
     Throw :: e -> Except e a
     Catch :: Member (Except e) es -> Eff es a -> (e -> Eff es a) -> Except e (Eff es a)
+
+throw :: (Except e :> es) => e -> Eff es a
+throw = perform . Throw
 
 catch :: (Except e :> es) => Eff es a -> (e -> Eff es a) -> Eff es a
 catch m hdl = performH $ Catch membership m hdl
@@ -260,6 +322,9 @@ data Writer w :: Effect where
     Listen :: Member (Writer w) es -> Eff es a -> Writer w (Eff es (w, a))
     Censor :: Member (Writer w) es -> (w -> w) -> Eff es a -> Writer w (Eff es a)
 
+tell :: (Writer w :> es) => w -> Eff es ()
+tell = perform . Tell
+
 listen :: (Writer w :> es) => Eff es a -> Eff es (w, a)
 listen m = performH $ Listen membership m
 
@@ -269,7 +334,7 @@ censor f m = performH $ Censor membership f m
 runWriter :: (Monoid w) => Eff (Writer w : es) a -> Eff es (w, a)
 runWriter = interpret (pure . (mempty,)) \case
     Tell w -> \k -> first (w <>) <$> k ()
-    Listen i m -> \k -> k $ runWriter (pull i m)
+    Listen i m -> \k -> k $ intercept i (pull i m)
     Censor i f m -> \k -> k do
         (w, x) <- runWriter (pull i m)
         send i $ Tell $ f w
@@ -278,7 +343,7 @@ runWriter = interpret (pure . (mempty,)) \case
 runWriterPre :: (Monoid w) => Eff (Writer w : es) a -> Eff es (w, a)
 runWriterPre = interpret (pure . (mempty,)) \case
     Tell w -> \k -> first (w <>) <$> k ()
-    Listen i m -> \k -> k $ runWriter (pull i m)
+    Listen i m -> \k -> k $ intercept i (pull i m)
     Censor i f m -> \k ->
         k $
             rewrite
@@ -289,21 +354,46 @@ runWriterPre = interpret (pure . (mempty,)) \case
                     Censor i' f' m' -> Censor i' f' m'
                 m
 
+{- |
+Retrieves the monoidal value accumulated by `tell` within the given action.
+The `tell` effect is not consumed and remains intact.
+-}
+intercept :: (Monoid w) => Member (Writer w) es -> Eff (Writer w : es) a -> Eff es (w, a)
+intercept i =
+    runWriter . reinterpret pure \case
+        Tell w -> \k -> do
+            -- Duplicate the Tell operation to both the head `Writer w` and the underlying `Writer w`
+            send hereMembership $ Tell w
+            send (weakenMembership i) $ Tell w
+            k ()
+        other -> sendWith hereMembership other
+
 -------------------- ** Non-deterministic computation effect
 
 data NonDet :: Effect where
     Empty :: NonDet a
     Choose :: NonDet Bool
+    Alt :: Member NonDet es -> Eff es a -> Eff es a -> NonDet (Eff es a)
     ObserveAll :: Member NonDet es -> Eff es a -> NonDet (Eff es [a])
+
+empty :: (NonDet :> es) => Eff es a
+empty = perform Empty
+
+choose :: (NonDet :> es) => Eff es Bool
+choose = perform Choose
+
+alt :: (NonDet :> es) => Eff es a -> Eff es a -> Eff es a
+alt m n = performH $ Alt membership m n
+
+observeAll :: (NonDet :> es) => Eff es a -> Eff es [a]
+observeAll m = performH $ ObserveAll membership m
 
 runNonDet :: Eff (NonDet : es) a -> Eff es [a]
 runNonDet = interpret (pure . singleton) \case
     Empty -> \_ -> pure []
     Choose -> \k -> liftA2 (++) (k False) (k True)
+    Alt _ m n -> \k -> liftA2 (++) (k m) (k n)
     ObserveAll i m -> \k -> k $ runNonDet $ pull i m
-
-observeAll :: (NonDet :> es) => Eff es a -> Eff es [a]
-observeAll m = performH $ ObserveAll membership m
 
 choice :: (NonDet :> es) => [a] -> Eff es a
 choice [] = perform Empty
@@ -313,37 +403,93 @@ choice (x : xs) =
         True -> choice xs
 
 -- ====================================================================================================
---  * Tests
+--  * Semantics Tests
 -- ====================================================================================================
 
--------------------- ** Example semantics-checking problems using [SemanticsZoo](https://github.com/lexi-lambda/eff/blob/master/notes/semantics-zoo.md)
+-------------------- ** Example semantics-checking problems from [SemanticsZoo](https://github.com/lexi-lambda/eff/blob/master/notes/semantics-zoo.md)
 
--- Work in progress
+-- All behaviors are identical to `eff`'s continuation-based semantics.
+
+---------- *** State + Error
+
+-- >>> testStateExcept
+-- (Right True,Right True)
+
+testStateExcept :: (Either () Bool, Either () Bool)
+testStateExcept = runPure do
+    let action :: (State Bool :> es, Except () :> es) => Eff es Bool
+        action = do
+            (put True *> throw ()) `catch` \() -> pure ()
+            get
+
+    x <- runState False . runExcept @() $ action
+    y <- runExcept @() . runState False $ action
+    pure (x, y)
+
+-- >>> testNonDetExcept
+-- ([Right True,Right False],Right [True,False],[Right False,Right True],Right [False,True])
+
+testNonDetExcept :: ([Either () Bool], Either () [Bool], [Either () Bool], Either () [Bool])
+testNonDetExcept = runPure do
+    let action1, action2 :: (NonDet :> es, Except () :> es) => Eff es Bool
+        action1 = (pure True `alt` throw ()) `catch` \() -> pure False
+        action2 = (throw () `alt` pure True) `catch` \() -> pure False
+
+    x <- runNonDet . runExcept @() $ action1
+    y <- runExcept @() . runNonDet $ action1
+    z <- runNonDet . runExcept @() $ action2
+    w <- runExcept @() . runNonDet $ action2
+
+    pure (x, y, z, w)
+
+-- >>> testNonDetWriter
+-- ([(3,(3,True)),(4,(4,False))],(6,[(3,True),(4,False)]))
+
+testNonDetWriter :: ([(Int, (Int, Bool))], (Int, [(Int, Bool)]))
+testNonDetWriter = runPure do
+    let action :: (NonDet :> es, Writer (Sum Int) :> es) => Eff es (Sum Int, Bool)
+        action = listen (add 1 *> ((add 2 $> True) `alt` (add 3 $> False)))
+          where
+            add = tell . Sum @Int
+
+    x <- runNonDet . runWriter @(Sum Int) $ action
+    y <- runWriter @(Sum Int) . runNonDet $ action
+
+    pure (coerce x, coerce y)
 
 -------------------- ** Miscellaneous run examples
+
+-- >>> testState
+-- 1
+
+testState :: Int
+testState = runPure $ runState @Int 0 do
+    x <- get @Int
+    put $ x + 1
+    get
 
 -- >>> testNonDet
 -- [[1,2,3,0],[1,2,3,1]]
 
 testNonDet :: [[Int]]
 testNonDet = runPure $ runNonDet do
-    b <- perform Choose
+    b <- choose
     observeAll do
         choice [1, 2, 3, if b then 1 else 0]
 
--- >>> testNSR
+-- >>> testNonScopedResumption
 -- (1,1,42)
 
-testNSR :: (Int, Int, Int)
-testNSR = runPure do
+testNonScopedResumption :: (Int, Int, Int)
+testNonScopedResumption = runPure do
     s <- runReader @Int 0 $ runCoroutine @() @() do
         (x, y) <- local @Int (+ 1) do
-            x <- perform $ Ask @Int
-            perform $ Yield @() @() ()
-            y <- perform $ Ask @Int
+            x <- ask
+            () <- yield ()
+            y <- ask
             pure (x, y)
 
-        z <- perform $ Ask @Int
+        z <- ask
 
         pure (x, y, z)
 
@@ -361,5 +507,5 @@ testNSR = runPure do
 testWriter :: (String, ())
 testWriter = runPure $ runWriterPre do
     censor (\s -> if s == "hello" then "goodbye" else s) do
-        perform $ Tell "hello"
-        perform $ Tell " world"
+        tell "hello"
+        tell " world"
