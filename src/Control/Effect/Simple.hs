@@ -410,7 +410,7 @@ choice (x : xs) =
 
 -- All behaviors are identical to `eff`'s continuation-based semantics.
 
----------- *** State + Error
+---------- *** State + Except
 
 -- >>> testStateExcept
 -- (Right True,Right True)
@@ -426,6 +426,7 @@ testStateExcept = runPure do
     y <- runExcept @() . runState False $ action
     pure (x, y)
 
+---------- *** NonDet + Except
 -- >>> testNonDetExcept
 -- ([Right True,Right False],Right [True,False],[Right False,Right True],Right [False,True])
 
@@ -441,6 +442,8 @@ testNonDetExcept = runPure do
     w <- runExcept @() . runNonDet $ action2
 
     pure (x, y, z, w)
+
+---------- *** NonDet + Writer
 
 -- >>> testNonDetWriter
 -- ([(3,(3,True)),(4,(4,False))],(6,[(3,True),(4,False)]))
