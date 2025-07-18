@@ -5,20 +5,28 @@
 -- SPDX-License-Identifier: MPL-2.0
 
 {- |
-Kyoによる高階エフェクトのハンドリング方法にインスパイアされた、主要なエフェクトのwell-typedで純粋な実装です。
+Inspired by Kyo's method for handling higher‑order effects, this is a pure, well‑typed
+implementation of the major effects.
 
-ここで定義して使用しているエフェクトシステム (Effモナド) 自体は[freer-simple](https://hackage.haskell.org/package/freer-simple)と等価な、
-（polysemyのように高階へは一般化されていない、プレーンな一階の）Freerモナドとopen-unionによるシンプルかつwell-typedで純粋な一階エフェクトシステム実装です。
-ここまでの部分については、Haskellの代数的エフェクトにおける新規な点は特ありません。
+The effect system (the "Eff" monad) defined and used here is itself equivalent to
+freer‑simple (https://hackage.haskell.org/package/freer-simple), a simple, pure, first‑order
+effect system implemented with a plain Freer monad (unlike Polysemy, it isn't generalized to
+higher‑order) and an open‑union. Up to this point, there's nothing novel from the standpoint of
+algebraic effects in Haskell.
 
-今回新規な、実現のための本質的な部分は、@pull@関数という非常にシンプルな、しかし気付くまでは決してわからなかったテクニックです。
-詳細は@pull@関数のドキュメントを参照してください。
+What's new here is the `pull` function, a very simple yet previously elusive technique that makes
+everything click.  See the `pull` function's doc for details.
 
-高階エフェクトがをうまくハンドリングする方法があると気付かせてくれたのが、Kyoによる高階エフェクトの実現方法でした。
-具体的には、このXでのリプライ中のReaderエフェクトのコード例を見て、弄って、それでようやく理解したのです。
-https://x.com/fbrasisil/status/1945476793814925429
+It was Kyo's realization of higher‑order effects that showed how to handle them elegantly. In
+particular, I finally understood it by experimenting with the Reader effect example in the reply
+on X: https://x.com/fbrasisil/status/1945476793814925429
 
-Kyoでは、以下のHaskell風の疑似コードに相当するものを実行すると、典型的なHaskellのエフェクトシステムが42を出力するのとは異なり、0を出力します。
+In Kyo, running the equivalent of the following Haskell-style pseudo‑code prints `0`, whereas a
+typical Haskell effect system would print `42`.
+
+( It may look like the type of `modifyZero` doesn’t line up with `runReader`, but that mismatch is
+the essential insight.
+See this Scala snippet for details: https://scastie.scala-lang.org/EmUHdYHzRcyPTmAfyiq7HQ )
 
 @
 modifyZero :: forall es a. Eff es a -> Eff es a
@@ -29,20 +37,24 @@ do
     print x
 @
 
-これは、Haskell（のエフェクトシステム）に慣れた人々にとってはかなり驚くべき挙動だと思います。
-というのも、@modifyZero@関数における型引数@es@は一切の制約なしに多相化されており、そのリスト内に@Reader Int@が含まれているという知識を利用してその挙動を変更するのはparametricityを破っているからです。
+This is quite surprising if you're used to Haskell ('s effect systems), because the type variable
+`es` in `modifyZero` is completely unconstrained, and using the fact that `Reader Int` lives in that
+list to alter behavior violates parametricity.
 
-Kyoでは、エフェクトのハンドル時におけるエフェクト（タグ）間の等価性判定を、型レベル計算ではなく、代わりにScalaにより提供される実行時型表現を一部利用することで、この動作を実現しています。
-Haskellの言葉で言うと、すべてのエフェクトについて、暗黙的に提供される@Typeable (e :: Effect)@を利用してエフェクトのマッチングをしているようなものです。
+In Kyo, this behavior is achieved not by type-level computation but by using Scala's runtime type
+information to decide effect (tag) equality at runtime. In Haskell terms, it's like having an
+implicit `Typeable (e :: Effect)` for every effect and using that to match effects.
 
-しかし、この動作のおかげで、Kyoでは高階エフェクトを実現するためにHaskellの常識とは全く異なる方法を自然に取ることができました。
-この方法では、エフェクトシステムが特別な高階エフェクトサポートを提供していなくても、形式的には一階エフェクトの形をとるようにして高階エフェクトをエンコードすることができます。
-ここではそれを、**高階エフェクトの一階化埋め込み**という言葉で呼びたいと思います。
-本ファイルのコードは、その巧妙なやり方を示すことを目的としています。
+Thanks to this, Kyo naturally adopts a completely different approach to realizing higher‑order
+effects. Even if the effect system doesn't natively support higher‑order effects, you can encode
+them in a formally first‑order shape. I call this technique **first‑order embedding of higher‑order effects**,
+and the code in this file is meant to demonstrate that clever trick.
 
-@pull@関数は、引数で渡されるmembershipを利用することで、parametricityを破らない形でこの動作を擬似的にエミュレートすることを可能にします。
-そして、高階エフェクトのエンコーディングの際、membershipもオペレーションのデータ内部に保持するようにすることで、@pull@関数にリスト中に当該エフェクトが存在していることのエビデンスを伝達します。
-この新規なテクニックにより、Kyoにおける高階エフェクトのハンドリング手法をHaskellでも実現できます。
+The `pull` function lets you emulate this behavior without breaking parametricity by taking a
+`membership` argument. By carrying that `membership` evidence inside the operation data when you
+encode a higher‑order effect, the `pull` function is given proof that the effect indeed appears in
+the list. This novel technique makes it possible to implement Kyo's higher‑order‑effect handling
+strategy in Haskell as well.
 -}
 module Control.Effect.Simple where
 
@@ -55,23 +67,23 @@ import Data.Kind (Type)
 import Data.List (singleton)
 
 -- ====================================================================================================
---  * エフェクトシステム実装
+--  * Effect system implementation
 -- ====================================================================================================
 
--- | エフェクトのカインド。
+-- | Kind of effects.
 type Effect = Type -> Type
 
--- | Effモナド。
+-- | The Eff monad.
 type Eff es = FreerT (Union es App) Identity
 
--------------------- ** オープンユニオン
+-------------------- ** Open union
 
--- | 汎用的なオープンユニオン。
+-- | Generic open union
 data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
     Here :: h x a -> Union (x : xs) h a
     There :: Union xs h a -> Union (x : xs) h a
 
--- | オープンユニオン内の要素のメンバーシップ（エビデンス）。
+-- | Membership of an element in the open union (evidence).
 data Membership h x xs = Membership
     { inject :: forall a. h x a -> Union xs h a
     , project :: forall a. Union xs h a -> Maybe (h x a)
@@ -90,21 +102,19 @@ instance {-# OVERLAPPABLE #-} (e :> es) => e :> (e' : es) where
         Here _ -> Nothing
         There u -> project membership u
 
--- | オープンユニオンをエフェクトリスト用に特殊化するためのヘルパー型。
+-- | Helper type to specialize an open union for effect lists.
 newtype App f a = App {getApp :: f a}
 
--- | エフェクトリスト内のメンバーシップ。
+-- | Membership within the effect list.
 type Member = Membership App :: Effect -> [Effect] -> Type
 
--------------------- ** エフェクトのハンドル
+-------------------- ** Handling effects
 
-{- |
-代数的エフェクトの用語における「ディープハンドラ」。
--}
+-- | A "deep handler" in the terminology of algebraic effects.
 interpret ::
-    -- | 値ハンドラ
+    -- | Value handler
     (a -> Eff es b) ->
-    -- | エフェクトハンドラ
+    -- | Effect handler
     (forall x. e x -> (x -> Eff es b) -> Eff es b) ->
     Eff (e : es) a ->
     Eff es b
@@ -117,7 +127,10 @@ interpret ret hdl (FreerT (Identity m)) =
                     Here e -> runIdentity . runFreerT $ hdl (getApp e) k
                     There u -> Freer u (tsingleton k)
 
--- | ハンドラに渡される継続において解釈が自動で再帰的にされないバージョンの@interpret@。代数的エフェクトの用語における「シャローハンドラ」。
+{- |
+A version of `interpret` in which the interpretation is not automatically recursive in the
+continuation passed to the handler. In algebraic-effects terminology, this is called a "shallow handler."
+-}
 interpretShallow ::
     (a -> Eff es b) ->
     (forall x. e x -> (x -> Eff (e : es) b) -> Eff es b) ->
@@ -132,74 +145,74 @@ interpretShallow ret hdl (FreerT (Identity m)) =
                     Here e -> runIdentity . runFreerT $ hdl (getApp e) (k >=> raise . ret)
                     There u -> Freer u (tsingleton $ interpretShallow ret hdl . k)
 
--------------------- ** 雑多な操作
+-------------------- ** Miscellaneous functions
 
 {- |
-ここでの高階エフェクトの「一階化」の核を構成しているテクニックを提供する関数です。
-多相化されたエフェクトリスト@es@の「下に埋もれている」エフェクト@e@を、membershipを使って「掘り起こし」てきて、
-エフェクトリストの先頭にまで「引っ張って」きます。
-@es@内には依然として（型レベルにおいては）@e@が残ったままになります（つまりてっぺんの@e@と重複した形になる）が、
-値レベルでは何が起こるかというと、@es@内の@e@のスロットからはオペレーションがすべて「吸い取られてなくなり」、
-一番上にすべて移動されます。
-つまり、オペレーションをスロット間移動（コピーではなく）する操作であり、水をポンプで組み上げるようなものです。
+This function provides the core technique for **first‑order embedding of higher‑order effects**.
+It 'digs up' an effect @e@ that's buried somewhere in the polymorphic effect list @es@ using the
+membership evidence, and 'pulls' it all the way to the front of the list.
+
+After pulling, type-level @es@ still contains @e@ (now duplicated at the head), but at the value
+level all operations for @e@ are sucked out of their original slot and moved to the top.
+In other words, it moves (not copies) operations between slots, like pumping water up from below.
 -}
 pull :: Member e es -> Eff es a -> Eff (e : es) a
 pull i = transFreerT \u -> case project i u of
     Just e -> Here e
     Nothing -> There u
 
--- | エフェクトリスト@es@内に保持されているエフェクト@e@のオペレーションを書き換える。
+-- | Rewrite the operations of effect @e@ stored in the effect list @es@.
 rewrite :: Member e es -> (forall x. e x -> e x) -> Eff es a -> Eff es a
 rewrite i f = transFreerT \u -> case project i u of
     Just e -> inject i $ App $ f $ getApp e
     Nothing -> u
 
--- | エフェクトリストを集合として拡張する。
+-- | Extend the effect list as a set (i.e. introduce a new effect to the front).
 raise :: Eff es a -> Eff (e : es) a
 raise = transFreerT There
 
--------------------- ** エフェクト実行
+-------------------- ** Performing effects
 
--- | エフェクトを実行する。
+-- | Perform an effect.
 perform :: (e :> es) => e a -> Eff es a
 perform = send membership
 
--- | 高階エフェクトを実行する。
+-- | Perform a higher-order effect.
 performH :: (e :> es) => e (Eff es a) -> Eff es a
 performH op = performWith op id
 
--- | エフェクトを継続付きで実行する。
+-- | Perform an effect with a continuation.
 performWith :: (e :> es) => e a -> (a -> Eff es b) -> Eff es b
 performWith = sendWith membership
 
--- | 指定されたメンバーシップのスロットにおいてエフェクトを実行する。
+-- | Perform an effect in the slot specified by the given membership.
 send :: Member e es -> e a -> Eff es a
 send i op = sendWith i op pure
 
--- | 指定されたメンバーシップのスロットにおいて、エフェクトを継続付きで実行する。
+-- | Perform an effect with a continuation in the slot specified by the given membership.
 sendWith :: Member e es -> e a -> (a -> Eff es b) -> Eff es b
 sendWith i op k = FreerT $ Identity $ Freer (inject i $ App op) (tsingleton k)
 
--------------------- ** Effモナド除去
+-------------------- ** Eliminating the Eff monad
 
--- | 最後に残ったエフェクトをモナドとして扱い、そこに落とすことで、Effモナドを除去する。
+-- | Treat the last remaining effect as a monad and drop into it to eliminate the Eff monad.
 runEff :: (Monad m) => Eff '[m] a -> m a
 runEff (FreerT m) = case runIdentity m of
     Pure x -> pure x
     Freer (Here (App n)) q -> n >>= runEff . qApp q
     Freer (There u) _ -> case u of {}
 
--- | エフェクトがすべてハンドルされた状況下で、純粋な結果値を取り出す。
+-- | Extract a pure result value when all effects have been handled.
 runPure :: Eff '[] a -> a
 runPure (FreerT m) = case runIdentity m of
     Pure x -> x
     Freer u _ -> case u of {}
 
 -- ====================================================================================================
---  * 各種エフェクト定義
+--  * Definitions of various effects
 -- ====================================================================================================
 
--------------------- ** Readerエフェクト
+-------------------- ** Reader effect
 
 data Reader r :: Effect where
     Ask :: Reader r r
@@ -213,7 +226,7 @@ runReader r = interpret pure \case
 local :: (Reader r :> es) => (r -> r) -> Eff es a -> Eff es a
 local f m = performH $ Local membership f m
 
--------------------- ** Coroutineエフェクト
+-------------------- ** Coroutine effect
 
 data Yield i o :: Effect where
     Yield :: i -> Yield i o o
@@ -223,7 +236,7 @@ data Status f i o a = Done a | Continue i (o -> f (Status f i o a))
 runCoroutine :: Eff (Yield i o : es) a -> Eff es (Status (Eff es) i o a)
 runCoroutine = interpret (pure . Done) \(Yield i) k -> pure $ Continue i k
 
--------------------- ** 例外エフェクト
+-------------------- ** Exception effect
 
 data Except e :: Effect where
     Throw :: e -> Except e a
@@ -240,7 +253,7 @@ runExcept = interpret (pure . Right) \case
             Left e -> hdl e
             Right x -> pure x
 
--------------------- ** Writerエフェクト
+-------------------- ** Writer effect
 
 data Writer w :: Effect where
     Tell :: w -> Writer w ()
@@ -276,7 +289,7 @@ runWriterPre = interpret (pure . (mempty,)) \case
                     Censor i' f' m' -> Censor i' f' m'
                 m
 
--------------------- ** 非決定論計算エフェクト
+-------------------- ** Non-deterministic computation effect
 
 data NonDet :: Effect where
     Empty :: NonDet a
@@ -300,10 +313,14 @@ choice (x : xs) =
         True -> choice xs
 
 -- ====================================================================================================
---  * テスト
+--  * Tests
 -- ====================================================================================================
 
--------------------- ** 雑多な実行例
+-------------------- ** Example semantics-checking problems using [SemanticsZoo](https://github.com/lexi-lambda/eff/blob/master/notes/semantics-zoo.md)
+
+-- Work in progress
+
+-------------------- ** Miscellaneous run examples
 
 -- >>> testNonDet
 -- [[1,2,3,0],[1,2,3,1]]
@@ -346,7 +363,3 @@ testWriter = runPure $ runWriterPre do
     censor (\s -> if s == "hello" then "goodbye" else s) do
         perform $ Tell "hello"
         perform $ Tell " world"
-
--------------------- ** [SemanticsZoo](https://github.com/lexi-lambda/eff/blob/master/notes/semantics-zoo.md)によるセマンティクス検査問題例
-
--- 作業中
