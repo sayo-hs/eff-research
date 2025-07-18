@@ -461,6 +461,24 @@ testNonDetWriter = runPure do
 
     pure (coerce x, coerce y)
 
+-------------------- ** https://github.com/hasura/eff/issues/12
+
+data SomeEff :: Effect where
+    SomeAction :: SomeEff String
+
+-- >>> testTheIssue12
+-- Left "not caught"
+
+testTheIssue12 :: Either String String
+testTheIssue12 = runPure do
+    let action :: (Except String :> es, SomeEff :> es) => Eff es String
+        action = perform SomeAction `catch` \(_ :: String) -> pure "caught"
+
+        runSomeEff :: (Except String :> es) => Eff (SomeEff ': es) a -> Eff es a
+        runSomeEff = interpret pure \SomeAction _ -> throw "not caught"
+
+    runExcept @String . runSomeEff $ action
+
 -------------------- ** Miscellaneous run examples
 
 -- >>> testState
