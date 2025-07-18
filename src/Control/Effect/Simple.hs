@@ -5,8 +5,9 @@
 -- SPDX-License-Identifier: MPL-2.0
 
 {- |
-Inspired by Kyo's method for handling higher‑order effects, this is a pure, well‑typed
+Inspired by [Kyo](https://getkyo.io/#/)'s method for handling higher‑order effects, this is a pure, well‑typed
 implementation of the major effects.
+
 
 The effect system (the "Eff" monad) defined and used here is itself equivalent to
 freer‑simple (https://hackage.haskell.org/package/freer-simple), a simple, pure, first‑order
