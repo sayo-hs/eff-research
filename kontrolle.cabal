@@ -64,7 +64,6 @@ library
     -- Modules exported by the library.
     exposed-modules:
         Data.FTCQueue
-        Control.Effect.Arrow
         Control.Effect.Simple
         Control.Monad.Trans.Freer
         Control.Monad.MultiPrompt.Formal

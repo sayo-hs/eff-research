@@ -53,16 +53,22 @@ data Sub (u :: [k]) (xs :: [k])
     }
 
 instance {-# INCOHERENT #-} (u < xs) => u < x : xs where
-    sub p =
-        Sub
-            { weaken = There . weaken (sub p)
-            , strengthen = \case
-                Here _ -> Nothing
-                There u -> strengthen (sub p) u
-            }
+    sub p = weakenSub $ sub p
+
+idSub :: Sub xs xs
+idSub = Sub{weaken = id, strengthen = Just}
+
+weakenSub :: Sub u xs -> Sub u (x : xs)
+weakenSub s =
+    Sub
+        { weaken = There . weaken s
+        , strengthen = \case
+            Here _ -> Nothing
+            There u -> strengthen s u
+        }
 
 instance xs < xs where
-    sub _ = Sub{weaken = id, strengthen = Just}
+    sub _ = idSub
 
 type data PromptFrame = Prompt (Type -> Type) Type
 
