@@ -21,7 +21,7 @@ import Data.Functor.Identity (Identity, runIdentity)
 import Data.Kind (Type)
 import Data.List (singleton)
 import Data.Proxy (Proxy (Proxy))
-import UnliftIO (MonadIO, MonadUnliftIO (withRunInIO), liftIO)
+import UnliftIO (MonadIO, MonadUnliftIO (withRunInIO))
 
 {- | An type-safe open union (extensible sum) that does not support permutation of the list, and
     behaves in a stack-like manner.
@@ -64,7 +64,7 @@ instance {-# INCOHERENT #-} (u < xs) => u < x : xs where
 instance xs < xs where
     sub _ = Sub{weaken = id, strengthen = Just}
 
-type data PromptFrame = Prompt (Type -> Type) Type [PromptFrame]
+type data PromptFrame = Prompt (Type -> Type) Type Bool
 
 {- | A type-safe multi-prompt/control monad transformer with reader environment.
 
@@ -78,8 +78,8 @@ newtype CtlT (ps :: [PromptFrame]) r m a = CtlT {unCtlT :: FreerT (StackUnion ps
     deriving (Functor, Applicative, Monad, MonadIO)
 
 data Control (m :: Type -> Type) (p :: PromptFrame) (u :: [PromptFrame]) (a :: Type) where
-    Control :: (forall w u x. Sub (Prompt f r u' : u) w -> (a -> CtlT w r m (f x)) -> CtlT w r m (f x)) -> Control m (Prompt f r u') u a
-    Control0 :: (forall x. (a -> CtlT u' r m (f x)) -> CtlT u' r m (f x)) -> Control m (Prompt f r u') u a
+    Control :: (forall w u' x. Sub (Prompt f r z : u') w -> (a -> CtlT w r m (f x)) -> CtlT w r m (f x)) -> Control m (Prompt f r z) u a
+    Control0 :: (forall x. (a -> CtlT u r m (f x)) -> CtlT u r m (f x)) -> Control m (Prompt f r 'True) u a
 
 cmapCtlT :: (Monad m) => (r -> r') -> CtlT ps r' m a -> CtlT ps r m a
 cmapCtlT f = CtlT . hoistFreerT (ReaderT . (. f) . runReaderT) . unCtlT
@@ -108,10 +108,10 @@ instance (Unlift b f, Functor f) => Unlift b (CtlT '[] r f) where
     withRunInBase f = CtlT $ FreerT $ Pure <$> withRunInBase \run -> f (run . ReaderT . flip runCtlT)
 
 prompt ::
-    forall f r' u' r ps m a.
+    forall f r' r ps m a.
     (Monad m) =>
     (r' -> r) ->
-    CtlT (Prompt f r' ps : ps) r m (f a) ->
+    CtlT (Prompt f r' 'False : ps) r m (f a) ->
     CtlT ps r' m (f a)
 prompt f m =
     CtlT . FreerT $ ReaderT \r ->
@@ -121,8 +121,24 @@ prompt f m =
                 let k x = CtlT $ qApp q x
                  in case ctls of
                         Here (Control ctl) -> runReaderT (runFreerT $ unCtlT $ prompt id $ ctl (Sub id Just) $ cmapCtlT f . k) r
-                        Here (Control0 ctl) -> runReaderT (runFreerT $ unCtlT $ ctl $ prompt f . k) r
                         There u -> pure $ Freer u (tsingleton $ unCtlT . prompt f . k)
+
+prompt0 ::
+    forall f r' r ps m a.
+    (Monad m) =>
+    (r' -> r) ->
+    CtlT (Prompt f r' 'True : ps) r m (f a) ->
+    CtlT ps r' m (f a)
+prompt0 f m =
+    CtlT . FreerT $ ReaderT \r ->
+        runReaderT (runFreerT (unCtlT m)) (f r) >>= \case
+            Pure x -> pure $ Pure x
+            Freer ctls q ->
+                let k x = CtlT $ qApp q x
+                 in case ctls of
+                        Here (Control ctl) -> runReaderT (runFreerT $ unCtlT $ prompt0 id $ ctl (Sub id Just) $ cmapCtlT f . k) r
+                        Here (Control0 ctl) -> runReaderT (runFreerT $ unCtlT $ ctl $ prompt0 f . k) r
+                        There u -> pure $ Freer u (tsingleton $ unCtlT . prompt0 f . k)
 
 delimit ::
     forall f r r' u' u ps m a.
@@ -143,15 +159,15 @@ delimit i f m =
 
 control ::
     (Applicative m) =>
-    Sub (Prompt f r' u' : u) ps ->
-    (forall w u x. Sub (Prompt f r' u' : u) w -> (a -> CtlT w r' m (f x)) -> CtlT w r' m (f x)) ->
+    Sub (Prompt f r' z : u) ps ->
+    (forall w u' x. Sub (Prompt f r' z : u') w -> (a -> CtlT w r' m (f x)) -> CtlT w r' m (f x)) ->
     CtlT ps r m a
 control i f = CtlT . liftF . weaken i $ Here $ Control f
 
 control0 ::
     (Applicative m) =>
-    Sub (Prompt f r' u' : u) ps ->
-    (forall x. (a -> CtlT u' r' m (f x)) -> CtlT u' r' m (f x)) ->
+    Sub (Prompt f r' 'True : u) ps ->
+    (forall x. (a -> CtlT u r' m (f x)) -> CtlT u r' m (f x)) ->
     CtlT ps r m a
 control0 i f = CtlT . liftF . weaken i $ Here $ Control0 f
 
@@ -178,41 +194,43 @@ raise = CtlT . transFreerT There . unCtlT
 
 data Status a b ps r m c = Done c | Continue a (b -> CtlT ps r m (Status a b ps r m c))
 
-yield :: (Monad m) => Sub (Prompt (Status a b u' r' m) r' u' : u) ps -> a -> CtlT ps r m b
-yield i x = control0 i \k -> pure $ Continue x $ undefined . k
+yield :: (Monad m) => Sub (Prompt (Status a b u r' m) r' 'True : u) ps -> a -> CtlT ps r m b
+yield i x = control0 i \k -> pure $ Continue x k
 
 runCoroutine ::
     (Monad m) =>
-    (Proxy (Prompt (Status a b ps r m) r ps : ps) -> CtlT (Prompt (Status a b ps r m) r ps : ps) r m c) ->
+    (Proxy (Prompt (Status a b ps r m) r 'True : ps) -> CtlT (Prompt (Status a b ps r m) r 'True : ps) r m c) ->
     CtlT ps r m (Status a b ps r m c)
-runCoroutine f = prompt id $ Done <$> f Proxy
+runCoroutine f = prompt0 id $ Done <$> f Proxy
 
-{-
-test :: IO ()
-test = runCtlT () do
+-- >>> test
+-- 1
+
+test :: Int
+test = runPure () do
     s <- runCoroutine \c -> do
-        liftIO $ putStrLn "a"
-        i <- yield (sub c) 0
-        liftIO $ print i
+        yield (sub c) 0
     case s of
         Continue (x :: Int) resume -> do
-            _ <- resume $ x + 1
-            pure ()
-        Done () -> pure ()
+            s' <- resume $ x + 1
+            case s' of
+                Done i -> pure i
+                Continue _ _ -> undefined
+        Done _ -> undefined
 
 runExc ::
     (Monad m) =>
-    (Proxy (Prompt (Either e) r : ps) -> CtlT (Prompt (Either e) r : ps) r m a) ->
+    (Proxy (Prompt (Either e) r 'False : ps) -> CtlT (Prompt (Either e) r 'False : ps) r m a) ->
     CtlT ps r m (Either e a)
 runExc f = prompt id $ Right <$> f Proxy
 
-throw :: (Monad m) => Sub (Prompt (Either e) r' : u) ps -> e -> CtlT ps r m a
+throw :: (Monad m) => Sub (Prompt (Either e) r' z : u) ps -> e -> CtlT ps r m a
 throw i e = abort i $ Left e
 
-try :: (Monad m) => Sub (Prompt (Either e) r : u) ps -> CtlT ps r m a -> CtlT ps r m (Either e a)
+try :: (Monad m) => Sub (Prompt (Either e) r z : u) ps -> CtlT ps r m a -> CtlT ps r m (Either e a)
 try i m = delimit i id $ Right <$> m
 
-catch :: (Monad m) => Sub (Prompt (Either e) r : u) ps -> CtlT ps r m a -> (e -> CtlT ps r m a) -> CtlT ps r m a
+catch :: (Monad m) => Sub (Prompt (Either e) r z : u) ps -> CtlT ps r m a -> (e -> CtlT ps r m a) -> CtlT ps r m a
 catch i m hdl = try i m >>= either hdl pure
 
 -- >>> test2
@@ -225,13 +243,13 @@ test2 = runPure () $ runExc \exc -> do
         (throw (sub exc) "abc")
         \e -> pure $ length e
 
-runNonDet :: (Monad m) => (Proxy (Prompt [] r : ps) -> CtlT (Prompt [] r : ps) r m a) -> CtlT ps r m [a]
+runNonDet :: (Monad m) => (Proxy (Prompt [] r 'False : ps) -> CtlT (Prompt [] r 'False : ps) r m a) -> CtlT ps r m [a]
 runNonDet f = prompt id $ singleton <$> f Proxy
 
-empty :: (Monad m) => Sub (Prompt [] r' : u) ps -> CtlT ps r m a
+empty :: (Monad m) => Sub (Prompt [] r' z : u) ps -> CtlT ps r m a
 empty i = abort i []
 
-choice :: forall r m u ps a. (Monad m) => Sub (Prompt [] r : u) ps -> [CtlT ps r m a] -> CtlT ps r m a
+choice :: forall r z m u ps a. (Monad m) => Sub (Prompt [] r z : u) ps -> [CtlT ps r m a] -> CtlT ps r m a
 choice i ms = do
     xs <- concat <$> mapM (delimit i id . fmap singleton) ms
     control i \i' k -> concat <$> mapM (delimit i' id . k) xs
@@ -247,4 +265,3 @@ test3 = runPure () $ runNonDet \nd -> do
             then throw (sub exc) "test"
             else pure x
     pure $ either length id x
--}
