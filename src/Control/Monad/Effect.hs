@@ -87,6 +87,12 @@ trans f (Eff m) =
             Pure x -> Pure x
             Freer u k -> Freer u $ trans f . k
 
+transCtl :: (forall ps'. Handlers ps' es' -> Handlers ps' es) -> Ctl ps es a -> Ctl ps es' a
+transCtl f (Ctl m) =
+    Ctl \hs -> case m (f hs) of
+        Pure x -> Pure x
+        Freer u k -> Freer u $ trans f . k
+
 raise :: Eff es a -> Eff (e : es) a
 raise = trans \(ConsHandler _ hs) -> hs
 
@@ -154,15 +160,13 @@ bindCtl (Ctl m) f = Ctl \hs -> case m hs of
 fmapCtl :: (a -> b) -> Ctl ps es a -> Ctl ps es b
 fmapCtl f m = m `bindCtl` (pure . f)
 
-{-
-delimit :: Membership (P f u) ps -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit :: Membership (P f u) ps -> Ctl ps u (f a) -> Ctl ps u (f a)
 delimit i (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
         Freer ctls k -> case project i ctls of
-            Just (Control ctl) -> unCtl (unEff $ undefined $ ctl $ trans undefined . k) hs
+            Just (Control ctl) -> unCtl (unEff $ ctl k) hs
             Nothing -> Freer ctls k
--}
 
 interpretShallow ::
     (forall w esSend x. Membership (P f (e : es)) w -> e x -> Ctl w esSend x) ->
@@ -197,12 +201,16 @@ runPure (Eff m) = case unCtl m NilHandler of
 
 data NonDet :: Effect where
     Choose :: NonDet Bool
+    Dummy :: NonDet [Int]
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
-runNonDet = interpret \i Choose -> control i \k -> do
-    xs <- k False
-    ys <- k True
-    pure $ xs ++ ys
+runNonDet = interpret \i -> \case
+    Choose ->
+        control i \k -> do
+            xs <- k False
+            ys <- k True
+            pure $ xs ++ ys
+    Dummy -> transCtl undefined $ delimit i undefined
 
 -- >>> test
 -- [(False,False),(False,True),(True,False),(True,True)]
@@ -217,7 +225,7 @@ data Reader r :: Effect where
     Ask :: Reader r r
 
 runReader :: r -> Eff (Reader r : es) a -> Eff es a
-runReader r = fmap runIdentity . interpret (\_ Ask -> Ctl \_ -> Pure r) . fmap Identity
+runReader r = fmap runIdentity . interpret (\_ Ask -> pureCtl r) . fmap Identity
 
 data Evil :: Effect where
     Evil :: Evil ()
