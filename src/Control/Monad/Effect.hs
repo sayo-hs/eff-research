@@ -71,7 +71,7 @@ data Handler ps e where
 data Handlers ps es where
     ConsHandler :: Handler ps e -> Handlers ps es -> Handlers ps (e : es)
     NilHandler :: Handlers '[] '[]
-    ConsPrompt :: Handlers ps es -> Handlers (p : ps) es
+    ConsPrompt :: Handlers ps '[] -> Handlers (p : ps) '[]
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
 
@@ -95,16 +95,10 @@ trans f (Eff m) =
             Freer u k -> Freer u $ trans f . k
 
 raise :: Eff es a -> Eff (e : es) a
-raise = trans $ transHandlers \case {} (\Refl _ hs -> hs)
+raise = trans \(ConsHandler _ hs) -> hs
 
-transHandlers ::
-    (forall. es :~: '[] -> Handlers '[] es') ->
-    (forall ps e u. es :~: e : u -> Handler ps e -> Handlers ps u -> Handlers ps es') ->
-    (forall ps. Handlers ps es -> Handlers ps es')
-transHandlers fNil fCons = \case
-    ConsHandler h hs -> fCons Refl h hs
-    NilHandler -> fNil Refl
-    ConsPrompt hs -> ConsPrompt $ transHandlers fNil fCons hs
+swap :: Handlers ps (e1 : e2 : es) -> Handlers ps (e2 : e1 : es)
+swap (ConsHandler h1 (ConsHandler h2 es)) = ConsHandler h2 (ConsHandler h1 es)
 
 type Ctl (ps :: [Prompt]) (es :: [Effect]) a = Handlers ps es -> EffCtlF ps es a
 
@@ -123,15 +117,19 @@ newtype HandlerMembership e es
 handlerMembership0 :: HandlerMembership e (e : es)
 handlerMembership0 = HandlerMembership \case
     ConsHandler h _ -> h
-    ConsPrompt hs -> weakenPrompt $ atHandler handlerMembership0 hs
 
 weakenHandlerMembership :: HandlerMembership e es -> HandlerMembership e (e' : es)
 weakenHandlerMembership i = HandlerMembership \case
     ConsHandler _ hs -> atHandler i hs
-    ConsPrompt hs -> weakenPrompt $ atHandler (weakenHandlerMembership i) hs
 
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
 weakenPrompt (Handler h i) = Handler h (weakenMembership i)
+
+liftPrompt :: Handlers ps es -> Handlers (p : ps) es
+liftPrompt = \case
+    ConsHandler h hs -> ConsHandler (weakenPrompt h) (liftPrompt hs)
+    NilHandler -> ConsPrompt NilHandler
+    ConsPrompt hs -> ConsPrompt $ ConsPrompt hs
 
 class e :> es where
     handlerMembership :: HandlerMembership e es
@@ -155,7 +153,7 @@ control i f _ = Freer (inject i $ Control f) pure
 interpret :: (forall x (y :: Type). e x -> (x -> Eff es (f y)) -> Eff es (f y)) -> Eff (e : es) (f a) -> Eff es (f a)
 interpret hdl (Eff m) =
     Eff \hs ->
-        let hs' = ConsHandler (Handler (\e i -> control i \k -> hdl e k) membership0) (ConsPrompt hs)
+        let hs' = ConsHandler (Handler (\e i -> control i \k -> hdl e k) membership0) (liftPrompt hs)
          in case m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
