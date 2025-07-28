@@ -12,8 +12,9 @@
 
 module Control.Monad.Effect where
 
-import Control.Monad (ap, (>=>))
+import Control.Monad (ap, join, (>=>))
 import Data.Functor.Const (Const)
+import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 
@@ -67,7 +68,7 @@ class Member x xs where
 instance Member x (x : xs) where
     membership = membership0
 
-instance (Member x xs) => Member x (x' : xs) where
+instance {-# OVERLAPPABLE #-} (Member x xs) => Member x (x' : xs) where
     membership = weakenMembership membership
 
 type Effect = Type -> Type
@@ -114,12 +115,24 @@ handlerMembership0 = HandlerMembership (\(Cons h _) -> h)
 weakenHandlerMembership :: HandlerMembership e es -> HandlerMembership e (e' : es)
 weakenHandlerMembership i = HandlerMembership (\(Cons _ hs) -> liftPrompt $ atHandler i hs)
 
+class e :> es where
+    handlerMembership :: HandlerMembership e es
+
+instance e :> (e : es) where
+    handlerMembership = handlerMembership0
+
+instance {-# OVERLAPPABLE #-} (e :> es) => e :> (e' : es) where
+    handlerMembership = weakenHandlerMembership handlerMembership
+
 liftPrompt :: Handler ps e -> Handler (p : ps) e
 liftPrompt (Handler h i) = Handler h (weakenMembership i)
 
 send :: HandlerMembership e es -> e a -> Eff es a
 send i e = Eff \hs -> case atHandler i hs of
     Handler h i' -> h e i' hs
+
+perform :: (e :> es) => e a -> Eff es a
+perform = send handlerMembership
 
 control :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
 control i f _ = Freer (inject i $ Control f) pure
@@ -134,6 +147,11 @@ interpret hdl (Eff m) =
                     Here (Control ctl) -> unEff (ctl $ interpret hdl . k) hs
                     There u -> Freer u $ interpret hdl . k
 
+runPure :: Eff '[] a -> a
+runPure (Eff m) = case m Nil of
+    Pure x -> x
+    Freer u _ -> case u of {}
+
 data NonDet :: Effect where
     Choose :: NonDet Bool
 
@@ -143,11 +161,6 @@ runNonDet = interpret \Choose k -> do
     ys <- k True
     pure $ xs ++ ys
 
-runPure :: Eff '[] a -> a
-runPure (Eff m) = case m Nil of
-    Pure x -> x
-    Freer u _ -> case u of {}
-
 -- >>> test
 -- [(False,False),(False,True),(True,False),(True,True)]
 
@@ -156,3 +169,30 @@ test = runPure $ runNonDet do
     b1 <- send handlerMembership0 Choose
     b2 <- send handlerMembership0 Choose
     pure [(b1, b2)]
+
+data Reader r :: Effect where
+    Ask :: Reader r r
+
+runReader :: r -> Eff (Reader r : es) a -> Eff es a
+runReader r = fmap runIdentity . interpret (\Ask k -> k r) . fmap Identity
+
+data Evil :: Effect where
+    Evil :: Evil ()
+
+runEvil :: Eff (Evil : es) a -> Eff es (Eff es a)
+runEvil = interpret (\Evil k -> pure $ join $ k ()) . fmap pure
+
+-- >>> testNSR
+-- (1,2)
+
+testNSR :: (Int, Int)
+testNSR = runPure do
+    let prog = do
+            x :: Int <- perform Ask
+            perform Evil
+            y :: Int <- perform Ask
+            pure (x, y)
+
+    k <- runReader @Int 1 $ runEvil prog
+
+    runReader @Int 2 k
