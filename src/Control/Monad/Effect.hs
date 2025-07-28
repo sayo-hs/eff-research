@@ -13,8 +13,10 @@
 module Control.Monad.Effect where
 
 import Control.Monad (ap, join, (>=>))
+import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
+import Data.Type.Equality ((:~:) (Refl))
 
 data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
     Here :: h x a -> Union (x : xs) h a
@@ -68,8 +70,8 @@ data Handler ps e where
 
 data Handlers ps es where
     ConsHandler :: Handler ps e -> Handlers ps es -> Handlers ps (e : es)
-    ConsPrompt :: Handlers ps es -> Handlers (p : ps) es
     NilHandler :: Handlers '[] '[]
+    ConsPrompt :: Handlers ps es -> Handlers (p : ps) es
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
 
@@ -84,6 +86,25 @@ instance Monad (Eff es) where
     Eff m >>= f = Eff \hs -> case m hs of
         Pure x -> unEff (f x) hs
         Freer u k -> Freer u (k >=> f)
+
+trans :: (forall ps. Handlers ps es' -> Handlers ps es) -> Eff es a -> Eff es' a
+trans f (Eff m) =
+    Eff \hs ->
+        case m (f hs) of
+            Pure x -> Pure x
+            Freer u k -> Freer u $ trans f . k
+
+raise :: Eff es a -> Eff (e : es) a
+raise = trans $ transHandlers \case {} (\Refl _ hs -> hs)
+
+transHandlers ::
+    (forall. es :~: '[] -> Handlers '[] es') ->
+    (forall ps e u. es :~: e : u -> Handler ps e -> Handlers ps u -> Handlers ps es') ->
+    (forall ps. Handlers ps es -> Handlers ps es')
+transHandlers fNil fCons = \case
+    ConsHandler h hs -> fCons Refl h hs
+    NilHandler -> fNil Refl
+    ConsPrompt hs -> ConsPrompt $ transHandlers fNil fCons hs
 
 type Ctl (ps :: [Prompt]) (es :: [Effect]) a = Handlers ps es -> EffCtlF ps es a
 
