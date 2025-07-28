@@ -13,51 +13,68 @@
 module Control.Monad.Effect where
 
 import Control.Monad (ap, (>=>))
+import Data.Functor.Const (Const)
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 
-data StackUnion (xs :: [k]) (h :: k -> [k] -> l -> Type) (a :: l) where
-    Here :: h x xs a -> StackUnion (x : xs) h a
-    There :: StackUnion xs h a -> StackUnion (x : xs) h a
+data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
+    Here :: h x a -> Union (x : xs) h a
+    There :: Union xs h a -> Union (x : xs) h a
 
-mapStackUnion :: (forall x r. h x r a -> i x r a) -> StackUnion xs h a -> StackUnion xs i a
-mapStackUnion f = \case
-    Here x -> Here $ f x
-    There xs -> There $ mapStackUnion f xs
+{-
+data Rec (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
+    Cons :: h x a -> Rec xs h a -> Rec (x : xs) h a
+    Nil :: Rec '[] h a
+-}
 
-forStackUnion :: StackUnion xs h a -> (forall x r. h x r a -> i x r a) -> StackUnion xs i a
-forStackUnion u f = mapStackUnion f u
-
-infix 4 <
-class u < xs where
-    sub :: Proxy u -> Sub u xs
-
-data Sub (u :: [k]) (xs :: [k])
-    = Sub
-    { weaken :: forall l h (a :: l). StackUnion u h a -> StackUnion xs h a
-    , strengthen :: forall l h (a :: l). StackUnion xs h a -> Maybe (StackUnion u h a)
+data Membership x xs = Membership
+    { inject :: forall l h (a :: l). h x a -> Union xs h a
+    , project :: forall l h (a :: l). Union xs h a -> Maybe (h x a)
+    {-, at :: forall l h (a :: l). Rec xs h a -> h x a
+    , update :: forall l h (a :: l). h x a -> Rec xs h a -> Rec xs h a
+    -}
     }
 
-instance {-# INCOHERENT #-} (u < xs) => u < x : xs where
-    sub p = weakenSub (sub p)
+membership0 :: Membership x (x : xs)
+membership0 =
+    Membership
+        Here
+        \case
+            Here x -> Just x
+            _ -> Nothing
 
-weakenSub :: Sub u xs -> Sub u (x : xs)
-weakenSub s =
-    Sub
-        { weaken = There . weaken s
-        , strengthen = \case
+{-
+(\(Cons h _) -> h)
+(\h (Cons _ hs) -> Cons h hs)
+-}
+
+weakenMembership :: Membership x xs -> Membership x (x' : xs)
+weakenMembership i =
+    Membership
+        (There . inject i)
+        \case
             Here _ -> Nothing
-            There u -> strengthen s u
-        }
+            There u -> project i u
 
-instance xs < xs where
-    sub _ = Sub{weaken = id, strengthen = Just}
+{-
+(\(Cons _ hs) -> at i hs)
+(\h (Cons h' hs) -> Cons h' $ update i h hs)
+-}
+
+class Member x xs where
+    membership :: Membership x xs
+
+instance Member x (x : xs) where
+    membership = membership0
+
+instance (Member x xs) => Member x (x' : xs) where
+    membership = weakenMembership membership
 
 type Effect = Type -> Type
-type Prompt = Type -> Type
+type data Prompt = P (Type -> Type) [Effect]
 
 data Handler ps e where
-    Handler :: (forall w u' es x. e x -> Sub (p : u') w -> Ctl w es x) -> Sub (p : u) ps -> Handler ps e
+    Handler :: (forall w es x. e x -> Membership p w -> Ctl w es x) -> Membership p ps -> Handler ps e
 
 data Handlers ps es where
     Cons :: Handler (p : ps) e -> Handlers ps es -> Handlers (p : ps) (e : es)
@@ -81,27 +98,36 @@ type Ctl (ps :: [Prompt]) (es :: [Effect]) a = Handlers ps es -> EffCtlF ps es a
 
 data EffCtlF ps es a
     = Pure a
-    | forall x. Freer (StackUnion ps Control x) (x -> Eff es a)
+    | forall x. Freer (Union ps Control x) (x -> Eff es a)
 
-data Control (f :: Prompt) (u :: [Prompt]) a where
-    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control f u a
+data Control (f :: Prompt) a where
+    Control :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u) a
 
-newtype Membership e es = Membership {getHandler :: forall ps. Handlers ps es -> Handler ps e}
+newtype HandlerMembership e es
+    = HandlerMembership
+    { atHandler :: forall ps. Handlers ps es -> Handler ps e
+    }
 
-hereMembership :: Membership e (e : es)
-hereMembership = Membership (\(Cons h _) -> h)
+handlerMembership0 :: HandlerMembership e (e : es)
+handlerMembership0 = HandlerMembership (\(Cons h _) -> h)
 
-send :: Membership e es -> e a -> Eff es a
-send (Membership getHandler) e = Eff \hs -> case getHandler hs of
-    Handler h i -> h e i hs
+weakenHandlerMembership :: HandlerMembership e es -> HandlerMembership e (e' : es)
+weakenHandlerMembership i = HandlerMembership (\(Cons _ hs) -> liftPrompt $ atHandler i hs)
 
-control :: Sub (p : u) ps -> (forall es' x. (a -> Eff es' (p x)) -> Eff es' (p x)) -> Ctl ps es a
-control i f _ = Freer (weaken i $ Here $ Control f) pure
+liftPrompt :: Handler ps e -> Handler (p : ps) e
+liftPrompt (Handler h i) = Handler h (weakenMembership i)
 
-interpret :: (forall es' x (y :: Type). e x -> (x -> Eff es' (p y)) -> Eff es' (p y)) -> Eff (e : es) (p a) -> Eff es (p a)
+send :: HandlerMembership e es -> e a -> Eff es a
+send i e = Eff \hs -> case atHandler i hs of
+    Handler h i' -> h e i' hs
+
+control :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
+control i f _ = Freer (inject i $ Control f) pure
+
+interpret :: (forall x (y :: Type). e x -> (x -> Eff es (f y)) -> Eff es (f y)) -> Eff (e : es) (f a) -> Eff es (f a)
 interpret hdl (Eff m) =
     Eff \hs ->
-        let hs' = Cons (Handler (\e i -> control i \k -> hdl e k) $ Sub id Just) hs
+        let hs' = Cons (Handler (\e i -> control i \k -> hdl e k) membership0) hs
          in case m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -127,6 +153,6 @@ runPure (Eff m) = case m Nil of
 
 test :: [(Bool, Bool)]
 test = runPure $ runNonDet do
-    b1 <- send hereMembership Choose
-    b2 <- send hereMembership Choose
+    b1 <- send handlerMembership0 Choose
+    b2 <- send handlerMembership0 Choose
     pure [(b1, b2)]
