@@ -12,13 +12,7 @@
 
 module Control.Monad.Effect where
 
-import Control.Monad (join)
-import Control.Monad.IO.Class (MonadIO)
-import Control.Monad.Trans.Reader (ReaderT (ReaderT), runReaderT)
-import Data.Coerce (Coercible, coerce)
-import Data.Function (fix)
-import Data.Functor.Const (Const (Const), getConst)
-import Data.Functor.Identity (Identity)
+import Control.Monad (ap, (>=>))
 import Data.Kind (Type)
 import Data.Proxy (Proxy (Proxy))
 
@@ -68,9 +62,17 @@ data Handlers ps es where
 
 newtype Eff ps es a = Eff {unEff :: Ctl ps es a}
 
-instance Functor (Eff ps es)
-instance Applicative (Eff ps es)
-instance Monad (Eff ps es)
+instance Functor (Eff ps es) where
+    fmap f = (>>= pure . f)
+
+instance Applicative (Eff ps es) where
+    pure x = Eff \_ -> Pure x
+    (<*>) = ap
+
+instance Monad (Eff ps es) where
+    Eff m >>= f = Eff \hs -> case m hs of
+        Pure x -> unEff (f x) hs
+        Freer u k -> Freer u (k >=> f)
 
 type Ctl (ps :: [Prompt]) (es :: [Effect]) a = Handlers ps es -> EffCtlF ps es a
 
@@ -79,22 +81,48 @@ data EffCtlF ps es a
     | forall x. Freer (StackUnion ps Control x) (x -> Eff ps es a)
 
 data Control (f :: Prompt) (u :: [Prompt]) a where
-    Control :: (forall w u' es x. Sub (f : u') w -> (a -> Eff w es (f x)) -> Eff w es (f x)) -> Control f u a
+    Control :: (forall w es x. (a -> Eff w es (f x)) -> Eff w es (f x)) -> Control f u a
 
 data Membership e es p ps = forall u. Membership {getHandler :: Handlers ps es -> Handler p e, getPrompt :: Sub (p : u) ps}
+
+hereMembership :: Membership e (e : es) p (p : ps)
+hereMembership = Membership (\(Cons h _) -> h) (Sub id Just)
 
 send :: Membership e es p ps -> e a -> Eff ps es a
 send (Membership getHandler p) e = Eff \hs -> let Handler h = getHandler hs in h e p hs
 
-control :: Sub (p : u) ps -> (forall w u' es' x. Sub (p : u') w -> (a -> Eff w es' (p x)) -> Eff w es' (p x)) -> Ctl ps es a
+control :: Sub (p : u) ps -> (forall w es' x. (a -> Eff w es' (p x)) -> Eff w es' (p x)) -> Ctl ps es a
 control i f _ = Freer (weaken i $ Here $ Control f) pure
 
 interpret :: (forall w es' x y. e x -> (x -> Eff w es' (p y)) -> Eff w es' (p y)) -> Eff (p : ps) (e : es) (p a) -> Eff ps es (p a)
-interpret hdl (Eff f) =
-    let h = Handler \e i -> control i \_ k -> hdl e k
+interpret hdl (Eff m) =
+    let h = Handler \e i -> control i \k -> hdl e k
      in Eff \hs ->
-            case f (Cons h hs) of
+            case m (Cons h hs) of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
-                    Here (Control ctl) -> unEff (interpret hdl $ ctl (Sub id Just) k) hs
+                    Here (Control ctl) -> unEff (ctl $ interpret hdl . k) hs
                     There u -> Freer u $ interpret hdl . k
+
+data NonDet :: Effect where
+    Choose :: NonDet Bool
+
+runNonDet :: Eff ([] : ps) (NonDet : es) [a] -> Eff ps es [a]
+runNonDet = interpret \Choose k -> do
+    xs <- k False
+    ys <- k True
+    pure $ xs ++ ys
+
+runPure :: Eff '[] '[] a -> a
+runPure (Eff m) = case m Nil of
+    Pure x -> x
+    Freer u _ -> case u of {}
+
+-- >>> test
+-- [(False,False),(False,True),(True,False),(True,True)]
+
+test :: [(Bool, Bool)]
+test = runPure $ runNonDet do
+    b1 <- send hereMembership Choose
+    b2 <- send hereMembership Choose
+    pure [(b1, b2)]
