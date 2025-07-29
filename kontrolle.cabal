@@ -63,6 +63,7 @@ library
 
     -- Modules exported by the library.
     exposed-modules:
+        Data.Extensible
         Data.FTCQueue
         Data.Unique.Tag
         Control.Monad.Trans.Freer

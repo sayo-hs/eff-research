@@ -5,52 +5,21 @@
 module Control.Monad.Effect where
 
 import Control.Monad (ap, join, (>=>))
+import Data.Extensible (
+    ExtConst (..),
+    Membership (inject, project),
+    Rec (..),
+    Union (..),
+    at,
+    mapRec,
+    membership,
+    membership0,
+    nil,
+    weakenMembership,
+    (:>),
+ )
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
-
-data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
-    Here :: h x a -> Union (x : xs) h a
-    There :: Union xs h a -> Union (x : xs) h a
-
-data Rec (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
-    Cons :: h x a -> Rec xs h a -> Rec (x : xs) h a
-    Nil :: Rec '[] h a
-
-data Membership x xs = Membership
-    { inject :: forall l h (a :: l). h x a -> Union xs h a
-    , project :: forall l h (a :: l). Union xs h a -> Maybe (h x a)
-    , at :: forall l h (a :: l). Rec xs h a -> h x a
-    , update :: forall l h (a :: l). h x a -> Rec xs h a -> Rec xs h a
-    }
-
-membership0 :: Membership x (x : xs)
-membership0 =
-    Membership
-        Here
-        \case
-            Here x -> Just x
-            _ -> Nothing
-        (\(Cons h _) -> h)
-        (\h (Cons _ hs) -> Cons h hs)
-
-weakenMembership :: Membership x xs -> Membership x (x' : xs)
-weakenMembership i =
-    Membership
-        (There . inject i)
-        \case
-            Here _ -> Nothing
-            There u -> project i u
-        (\(Cons _ hs) -> at i hs)
-        (\h (Cons h' hs) -> Cons h' $ update i h hs)
-
-class Member x xs where
-    membership :: Membership x xs
-
-instance Member x (x : xs) where
-    membership = membership0
-
-instance {-# OVERLAPPABLE #-} (Member x xs) => Member x (x' : xs) where
-    membership = weakenMembership membership
 
 type Effect = Type -> Type
 type data Prompt = P (Type -> Type) [Effect]
@@ -61,10 +30,7 @@ data Handler ps e where
         Membership (P f es) ps ->
         Handler ps e
 
-data Handlers ps es where
-    ConsHandler :: Handler ps e -> Handlers ps es -> Handlers ps (e : es)
-    NilHandler :: Handlers '[] '[]
-    ConsPrompt :: Handlers ps '[] -> Handlers (p : ps) '[]
+type Handlers ps es = Rec es (ExtConst (Handler ps)) '()
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
 
@@ -94,10 +60,10 @@ transCtl f (Ctl m) =
         Freer u k -> Freer u $ trans f . k
 
 raise :: Eff es a -> Eff (e : es) a
-raise = trans \(ConsHandler _ hs) -> hs
+raise = trans \(Cons _ hs) -> hs
 
 swap :: Handlers ps (e1 : e2 : es) -> Handlers ps (e2 : e1 : es)
-swap (ConsHandler h1 (ConsHandler h2 es)) = ConsHandler h2 (ConsHandler h1 es)
+swap (Cons h1 (Cons h2 es)) = Cons h2 (Cons h1 es)
 
 newtype Ctl (ps :: [Prompt]) (es :: [Effect]) a = Ctl {unCtl :: Handlers ps es -> EffCtlF ps es a}
 
@@ -108,43 +74,18 @@ data EffCtlF ps es a
 data Control (f :: Prompt) a where
     Control :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u) a
 
-newtype HandlerMembership e es
-    = HandlerMembership
-    { atHandler :: forall ps. Handlers ps es -> Handler ps e
-    }
-
-handlerMembership0 :: HandlerMembership e (e : es)
-handlerMembership0 = HandlerMembership \case
-    ConsHandler h _ -> h
-
-weakenHandlerMembership :: HandlerMembership e es -> HandlerMembership e (e' : es)
-weakenHandlerMembership i = HandlerMembership \case
-    ConsHandler _ hs -> atHandler i hs
-
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
 weakenPrompt (Handler h i) = Handler h (weakenMembership i)
 
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
-liftPrompt = \case
-    ConsHandler h hs -> ConsHandler (weakenPrompt h) (liftPrompt hs)
-    NilHandler -> ConsPrompt NilHandler
-    ConsPrompt hs -> ConsPrompt $ ConsPrompt hs
+liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
-class e :> es where
-    handlerMembership :: HandlerMembership e es
-
-instance e :> (e : es) where
-    handlerMembership = handlerMembership0
-
-instance {-# OVERLAPPABLE #-} (e :> es) => e :> (e' : es) where
-    handlerMembership = weakenHandlerMembership handlerMembership
-
-send :: HandlerMembership e es -> e a -> Eff es a
-send i e = Eff $ Ctl \hs -> case atHandler i hs of
-    Handler h i' -> unCtl (h i' e) hs
+send :: Membership e es -> e a -> Eff es a
+send i e = Eff $ Ctl \hs -> case at i hs of
+    ExtConst (Handler h i') -> unCtl (h i' e) hs
 
 perform :: (e :> es) => e a -> Eff es a
-perform = send handlerMembership
+perform = send membership
 
 control :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
 control i f = Ctl \_ -> Freer (inject i $ Control f) pure
@@ -174,7 +115,7 @@ interpretShallow ::
     Eff es (f a)
 interpretShallow h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = ConsHandler (Handler h membership0) (liftPrompt hs)
+        let hs' = Cons (ExtConst $ Handler h membership0) (liftPrompt hs)
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -187,7 +128,7 @@ interpret ::
     Eff es (f a)
 interpret h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = ConsHandler (Handler h membership0) (liftPrompt hs)
+        let hs' = Cons (ExtConst $ Handler h membership0) (liftPrompt hs)
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -195,9 +136,9 @@ interpret h (Eff m) =
                     There u -> Freer u $ interpret h . k
 
 runPure :: Eff '[] a -> a
-runPure (Eff m) = case unCtl m NilHandler of
+runPure (Eff m) = case unCtl m Nil of
     Pure x -> x
-    Freer u _ -> case u of {}
+    Freer u _ -> nil u
 
 data NonDet :: Effect where
     Choose :: NonDet Bool
