@@ -72,7 +72,8 @@ data EffCtlF ps es a
     | forall x. Freer (Union ps Control x) (x -> Eff es a)
 
 data Control (f :: Prompt) a where
-    Control :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u) a
+    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u) a
+    Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u) a
 
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
 weakenPrompt (Handler h i) = Handler h (weakenMembership i)
@@ -87,8 +88,11 @@ send i e = Eff $ Ctl \hs -> case at i hs of
 perform :: (e :> es) => e a -> Eff es a
 perform = send membership
 
-control :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
-control i f = Ctl \_ -> Freer (inject i $ Control f) pure
+control :: Membership (P f u) ps -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
+control i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
+
+control0 :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
+control0 i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
 
 pureCtl :: a -> Ctl ps es a
 pureCtl x = Ctl \_ -> Pure x
@@ -101,13 +105,13 @@ bindCtl (Ctl m) f = Ctl \hs -> case m hs of
 fmapCtl :: (a -> b) -> Ctl ps es a -> Ctl ps es b
 fmapCtl f m = m `bindCtl` (pure . f)
 
-delimit :: Membership (P f u) ps -> Ctl ps u (f a) -> Ctl ps u (f a)
+delimit :: Membership (P f u) ps -> Ctl ps es (f a) -> Ctl ps es (f a)
 delimit i (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
         Freer ctls k -> case project i ctls of
             Just (Control ctl) -> unCtl (unEff $ ctl k) hs
-            Nothing -> Freer ctls k
+            _ -> Freer ctls k
 
 interpretShallow ::
     (forall w esSend x. Membership (P f (e : es)) w -> e x -> Ctl w esSend x) ->
@@ -120,6 +124,7 @@ interpretShallow h (Eff m) =
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
                     Here (Control ctl) -> unCtl (unEff $ interpretShallow h $ ctl k) hs
+                    Here (Control0 ctl) -> unCtl (unEff $ interpretShallow h $ ctl k) hs
                     There u -> Freer u $ interpretShallow h . k
 
 interpret ::
@@ -133,6 +138,7 @@ interpret h (Eff m) =
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
                     Here (Control ctl) -> unCtl (unEff $ ctl $ interpret h . k) hs
+                    Here (Control0 ctl) -> unCtl (unEff $ ctl $ interpret h . k) hs
                     There u -> Freer u $ interpret h . k
 
 runPure :: Eff '[] a -> a
@@ -151,7 +157,8 @@ runNonDet = interpret \i -> \case
             xs <- k False
             ys <- k True
             pure $ xs ++ ys
-    Dummy -> transCtl undefined $ delimit i undefined
+    Dummy ->
+        delimit i undefined
 
 -- >>> test
 -- [(False,False),(False,True),(True,False),(True,True)]
@@ -172,7 +179,7 @@ data Evil :: Effect where
     Evil :: Evil ()
 
 runEvil :: Eff (Evil : es) a -> Eff es (Eff es a)
-runEvil = interpret (\i Evil -> control i \k -> pure $ join $ k ()) . fmap pure
+runEvil = interpret (\i Evil -> control0 i \k -> pure $ join $ k ()) . fmap pure
 
 -- >>> testNSR
 -- (1,2)
