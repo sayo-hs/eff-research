@@ -1,10 +1,11 @@
--- SPDX-License-Identifier: MPL-2.0
+{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE TypeData #-}
+
+-- SPDX-License-Identifier: MPL-2.0
 
 module Control.Monad.Effect.DynamicPromptStack where
 
 import Control.Monad (ap, join, (>=>))
-import Control.Monad.Effect
 import Data.Extensible (
     ExtConst (..),
     Membership (inject, project),
@@ -14,10 +15,13 @@ import Data.Extensible (
     mapRec,
     membership,
     membership0,
+    memberships,
     nil,
+    subset,
     update,
     weakenMembership,
     (:>),
+    type (<),
  )
 import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
@@ -37,13 +41,13 @@ data Except e :: Effect where
 data SomeEff :: Effect where
     SomeEff :: SomeEff Int
 
-type data Prompt = P (Type -> Type) [Effect] Effect
+type data Prompt = P (Type -> Type) [Effect] [Effect]
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership (P f u d) w -> Handler w d -> e x -> Ctl w esSend x) ->
-        Membership (P f u d) ps ->
-        Handler ps d ->
+        (forall w esSend x. Membership w (P f u d) -> Handlers w d -> e x -> Ctl w esSend x) ->
+        Membership ps (P f u d) ->
+        Handlers ps d ->
         Handler ps e
 
 type Handlers ps es = Rec es (ExtConst (Handler ps)) '()
@@ -95,25 +99,28 @@ data Control (f :: Prompt) a where
     Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u d) a
 
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
-weakenPrompt (Handler h i d) = Handler h (weakenMembership i) (weakenPrompt d)
+weakenPrompt (Handler h i d) = Handler h (weakenMembership i) (liftPrompt d)
 
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
-send :: Membership e es -> e a -> Eff es a
+send :: Membership es e -> e a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
     ExtConst (Handler h i' d) -> unCtl (h i' d e) hs
 
 sendWith :: Handler ps e -> e a -> Ctl ps es a
 sendWith (Handler h i d) = h i d
 
+performWith :: (e :> d) => Handlers ps d -> e a -> Ctl ps es a
+performWith d = sendWith $ getExtConst $ at membership d
+
 perform :: (e :> es) => e a -> Eff es a
 perform = send membership
 
-control :: Membership (P f u d) ps -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
+control :: Membership ps (P f u d) -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
 control i f = Ctl \_ -> Freer (inject i $ Control f) pure
 
-control0 :: Membership (P f u d) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
+control0 :: Membership ps (P f u d) -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
 control0 i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
 
 pureCtl :: a -> Ctl ps es a
@@ -127,7 +134,7 @@ bindCtl (Ctl m) f = Ctl \hs -> case m hs of
 fmapCtl :: (a -> b) -> Ctl ps es a -> Ctl ps es b
 fmapCtl f m = m `bindCtl` (pure . f)
 
-delimit :: Membership (P f u d) ps -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit :: Membership ps (P f u d) -> Ctl ps es (f a) -> Ctl ps es (f a)
 delimit i (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
@@ -152,13 +159,13 @@ interpretShallow h (Eff m) =
 -}
 
 interpret ::
-    (d :> es) =>
-    (forall w esSend x. Membership (P f es d) w -> Handler w d -> e x -> Ctl w esSend x) ->
+    (d < es) =>
+    (forall w esSend x. Membership w (P f es d) -> Handlers w d -> e x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = Cons (ExtConst $ Handler h membership0 (getExtConst $ at membership $ liftPrompt hs)) (liftPrompt hs)
+        let hs' = Cons (ExtConst $ Handler h membership0 (subset memberships $ liftPrompt hs)) (liftPrompt hs)
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -172,7 +179,7 @@ runPure (Eff m) = case unCtl m Nil of
     Freer u _ -> nil u
 
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
-runSomeEff = fmap runIdentity . interpret @(Except String) (\_ h SomeEff -> sendWith h $ Throw "") . fmap Identity
+runSomeEff = fmap runIdentity . interpret @'[Except String] (\_ h SomeEff -> performWith h $ Throw "") . fmap Identity
 
 {-
 runExcept :: Eff (Except e : es) a -> Eff es (Either e a)
