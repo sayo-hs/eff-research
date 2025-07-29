@@ -70,6 +70,8 @@ library
         Control.Monad.MultiPrompt.Formal
         Control.Monad.MultiPrompt.Formal2
         Control.Monad.Effect
+        Control.Monad.Effect.DynamicPromptStack
+        Control.Monad.Effect.StaticPromptStack
 
     -- Modules included in this library but not exported.
     -- other-modules:

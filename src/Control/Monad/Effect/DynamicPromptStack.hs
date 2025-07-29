@@ -1,8 +1,7 @@
+-- SPDX-License-Identifier: MPL-2.0
 {-# LANGUAGE TypeData #-}
 
--- SPDX-License-Identifier: MPL-2.0
-
-module Control.Monad.Effect where
+module Control.Monad.Effect.DynamicPromptStack where
 
 import Control.Monad (ap, join, (>=>))
 import Data.Extensible (
@@ -15,9 +14,11 @@ import Data.Extensible (
     membership,
     membership0,
     nil,
+    update,
     weakenMembership,
     (:>),
  )
+import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
 
@@ -61,6 +62,9 @@ transCtl f (Ctl m) =
 
 raise :: Eff es a -> Eff (e : es) a
 raise = trans \(Cons _ hs) -> hs
+
+raiseUnder :: Eff (e : es) a -> Eff (e : e' : es) a
+raiseUnder = trans \(Cons h (Cons _ hs)) -> Cons h hs
 
 swap :: Handlers ps (e1 : e2 : es) -> Handlers ps (e2 : e1 : es)
 swap (Cons h1 (Cons h2 es)) = Cons h2 (Cons h1 es)
@@ -146,43 +150,93 @@ runPure (Eff m) = case unCtl m Nil of
     Pure x -> x
     Freer u _ -> nil u
 
+data Except e :: Effect where
+    Throw :: e -> Except e f a
+    Try :: f a -> Except e f (Either e a)
+
+runExcept :: Eff (Except e : es) a -> Eff es (Either e a)
+runExcept m =
+    Right <$> m & interpret \_ i -> \case
+        Throw e -> control i \_ -> pure $ Left e
+        Try n -> delimit i $ unEff $ Right <$> n
+
+catch :: (Except e :> es) => Eff es a -> (e -> Eff es a) -> Eff es a
+catch m hdl =
+    perform (Try m) >>= \case
+        Left e -> hdl e
+        Right x -> pure x
+
+-- >>> testE
+-- Left "uncaught"
+
+testE :: Either String Int
+testE = runPure $ runExcept $ runSomeEff do
+    catch @String
+        (perform SomeEff)
+        (pure . length)
+
+data SomeEff :: Effect where
+    SomeEff :: SomeEff f Int
+
+runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
+runSomeEff = fmap runIdentity . interpret (\_ i SomeEff -> control0 i \_ -> perform $ Throw "uncaught") . fmap Identity
+
 data NonDet :: Effect where
     Choose :: NonDet f Bool
-    Observe :: f a -> NonDet f [a]
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
-runNonDet = interpret \ih ip -> \case
+runNonDet = interpret \_ i -> \case
     Choose ->
-        control ip \k -> do
+        control i \k -> do
             xs <- k False
             ys <- k True
             pure $ xs ++ ys
-    Observe (Eff a) ->
-        delimit ip $ fmapCtl pure a
 
 -- >>> test
--- [Identity [(False,False)],Identity [(False,True)],Identity [(True,False)],Identity [(True,True)]]
+-- [(False,False),(False,True),(True,False),(True,True)]
 
-test :: [Identity [(Bool, Bool)]]
+test :: [(Bool, Bool)]
 test = runPure $ runNonDet do
-    x <- perform $ Observe do
-        b1 <- perform Choose
-        b2 <- perform Choose
-        pure (b1, b2)
-    pure [Identity x]
+    b1 <- perform Choose
+    b2 <- perform Choose
+    pure [(b1, b2)]
 
-{-
 data Reader r :: Effect where
-    Ask :: Reader r r
+    Ask :: Reader r f r
+
+-- Local :: (r -> r) -> f a -> Reader r f a
 
 runReader :: r -> Eff (Reader r : es) a -> Eff es a
-runReader r = fmap runIdentity . interpret (\_ Ask -> pureCtl r) . fmap Identity
+runReader r =
+    fmap runIdentity
+        . interpret
+            ( \i _ -> \case
+                Ask -> pureCtl r
+                -- Local f m -> unEff $ runReader (f r) (pull i m)
+            )
+        . fmap Identity
+
+{-
+runReader2 :: r -> Eff (Reader r : es) a -> Eff es a
+runReader2 r m = do
+    runReader @Int 10 do
+        fmap runIdentity
+            . interpret
+                ( \i ip -> \case
+                    Ask -> pureCtl r
+                    Local f m' -> do
+                        (control ip \k -> undefined)
+                            `bindCtl` (\_ -> runReader (f r) (pull i m'))
+                )
+            . fmap Identity
+            $ raiseUnder m
+-}
 
 data Evil :: Effect where
-    Evil :: Evil ()
+    Evil :: Evil f ()
 
 runEvil :: Eff (Evil : es) a -> Eff es (Eff es a)
-runEvil = interpret (\i Evil -> control0 i \k -> pure $ join $ k ()) . fmap pure
+runEvil = interpret (\_ i Evil -> control0 i \k -> pure $ join $ k ()) . fmap pure
 
 -- >>> testNSR
 -- (1,2)
@@ -198,4 +252,3 @@ testNSR = runPure do
     k <- runReader @Int 1 $ runEvil prog
 
     runReader @Int 2 k
--}
