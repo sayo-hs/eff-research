@@ -21,12 +21,12 @@ import Data.Extensible (
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
 
-type Effect = Type -> Type
+type Effect = (Type -> Type) -> Type -> Type
 type data Prompt = P (Type -> Type) [Effect]
 
 data Handler ps e where
     Handler ::
-        (forall w es' x. Membership (P f es) w -> e x -> Ctl w es' x) ->
+        (forall w esSend x. Membership e esSend -> Membership (P f es) w -> e (Eff esSend) x -> Ctl w esSend x) ->
         Membership (P f es) ps ->
         Handler ps e
 
@@ -81,11 +81,11 @@ weakenPrompt (Handler h i) = Handler h (weakenMembership i)
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
-send :: Membership e es -> e a -> Eff es a
+send :: Membership e es -> e (Eff es) a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
-    ExtConst (Handler h i') -> unCtl (h i' e) hs
+    ExtConst (Handler h i') -> unCtl (h i i' e) hs
 
-perform :: (e :> es) => e a -> Eff es a
+perform :: (e :> es) => e (Eff es) a -> Eff es a
 perform = send membership
 
 control :: Membership (P f u) ps -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
@@ -114,7 +114,7 @@ delimit i (Ctl m) = Ctl \hs ->
             _ -> Freer ctls k
 
 interpretShallow ::
-    (forall w esSend x. Membership (P f (e : es)) w -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership e esSend -> Membership (P f (e : es)) w -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpretShallow h (Eff m) =
@@ -128,7 +128,7 @@ interpretShallow h (Eff m) =
                     There u -> Freer u $ interpretShallow h . k
 
 interpret ::
-    (forall w esSend x. Membership (P f es) w -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership e esSend -> Membership (P f es) w -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
@@ -147,28 +147,31 @@ runPure (Eff m) = case unCtl m Nil of
     Freer u _ -> nil u
 
 data NonDet :: Effect where
-    Choose :: NonDet Bool
-    Dummy :: NonDet [Int]
+    Choose :: NonDet f Bool
+    Observe :: f a -> NonDet f [a]
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
-runNonDet = interpret \i -> \case
+runNonDet = interpret \ih ip -> \case
     Choose ->
-        control i \k -> do
+        control ip \k -> do
             xs <- k False
             ys <- k True
             pure $ xs ++ ys
-    Dummy ->
-        delimit i undefined
+    Observe (Eff a) ->
+        delimit ip $ fmapCtl pure a
 
 -- >>> test
--- [(False,False),(False,True),(True,False),(True,True)]
+-- [Identity [(False,False)],Identity [(False,True)],Identity [(True,False)],Identity [(True,True)]]
 
-test :: [(Bool, Bool)]
+test :: [Identity [(Bool, Bool)]]
 test = runPure $ runNonDet do
-    b1 <- perform Choose
-    b2 <- perform Choose
-    pure [(b1, b2)]
+    x <- perform $ Observe do
+        b1 <- perform Choose
+        b2 <- perform Choose
+        pure (b1, b2)
+    pure [Identity x]
 
+{-
 data Reader r :: Effect where
     Ask :: Reader r r
 
@@ -195,3 +198,4 @@ testNSR = runPure do
     k <- runReader @Int 1 $ runEvil prog
 
     runReader @Int 2 k
+-}
