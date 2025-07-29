@@ -4,16 +4,21 @@
 module Control.Monad.Effect.StaticPromptStack where
 
 import Control.Monad (ap, (>=>))
-import Control.Monad.Effect (Effect)
+import Control.Monad.Effect (Effect, Except (..), NonDet (..), SomeEff (..))
 import Data.Extensible (
     ExtConst (..),
     Membership (at, inject),
     Rec (..),
     Union (..),
     mapRec,
+    membership,
     membership0,
+    nil,
+    project,
     weakenMembership,
+    (:>),
  )
+import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
@@ -70,6 +75,9 @@ send :: Membership e es -> e (Eff es) a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
     ExtConst (Handler h i') -> unCtl (h i i' e) hs
 
+perform :: (e :> es) => e (Eff es) a -> Eff es a
+perform = send membership
+
 control ::
     Membership (P f u ues) ps ->
     (forall ps' es' x. Membership (P f u ues) ps' -> (a -> Ctl ps' es' (f x)) -> Ctl ps' es' (f x)) ->
@@ -106,3 +114,60 @@ interpret ::
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) = Eff $ Ctl \hs -> unCtl (interpretCtl (\ih ip -> h ih ip hs) m) hs
+
+delimit :: Membership (P f u ues) ps -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit i (Ctl m) = Ctl \hs ->
+    case m hs of
+        Pure x -> Pure x
+        Freer ctls k -> case project i ctls of
+            Just (Control ctl) -> unCtl (ctl i k) hs
+            _ -> Freer ctls k
+
+runPure :: Eff '[] a -> a
+runPure (Eff (Ctl m)) = case m Nil of
+    Pure x -> x
+    Freer u _ -> nil u
+
+runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
+runNonDet =
+    interpret \_ i _ -> \case
+        Choose -> control i \i' k -> do
+            xs <- delimit i' $ k True
+            ys <- delimit i' $ k False
+            pure $ xs ++ ys
+        Observe m -> delimit i $ unEff m
+
+-- >>> test
+-- [Identity [(True,True),(True,False),(False,True),(False,False)]]
+
+test :: [Identity [(Bool, Bool)]]
+test = runPure $ runNonDet do
+    xs <- perform $ Observe do
+        x <- perform Choose
+        y <- perform Choose
+        pure [(x, y)]
+    pure [Identity xs]
+
+runExcept :: Eff (Except e : es) (Either e a) -> Eff es (Either e a)
+runExcept = interpret \_ i _ -> \case
+    Throw e -> control i \_ _ -> pure $ Left e
+    Try m -> delimit i $ Right <$> unEff m
+
+runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
+runSomeEff = fmap runIdentity . interpret (\_ i _ SomeEff -> control0 i \_ -> unEff $ perform $ Throw "uncaught") . fmap Identity
+
+catch :: (Except e :> es) => Eff es a -> (e -> Eff es a) -> Eff es a
+catch m hdl =
+    perform (Try m) >>= \case
+        Left e -> hdl e
+        Right x -> pure x
+
+-- >>> testE
+-- Left "uncaught"
+
+testE :: Either String Int
+testE = runPure $ runExcept $ runSomeEff do
+    Right
+        <$> catch @String
+            (perform SomeEff)
+            (pure . length)

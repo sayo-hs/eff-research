@@ -150,10 +150,6 @@ runPure (Eff m) = case unCtl m Nil of
     Pure x -> x
     Freer u _ -> nil u
 
-data Except e :: Effect where
-    Throw :: e -> Except e f a
-    Try :: f a -> Except e f (Either e a)
-
 runExcept :: Eff (Except e : es) a -> Eff es (Either e a)
 runExcept m =
     Right <$> m & interpret \_ i -> \case
@@ -175,15 +171,8 @@ testE = runPure $ runExcept $ runSomeEff do
         (perform SomeEff)
         (pure . length)
 
-data SomeEff :: Effect where
-    SomeEff :: SomeEff f Int
-
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
 runSomeEff = fmap runIdentity . interpret (\_ i SomeEff -> control0 i \_ -> perform $ Throw "uncaught") . fmap Identity
-
-data NonDet :: Effect where
-    Choose :: NonDet f Bool
-    Observe :: f [a] -> NonDet f [a]
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
 runNonDet = interpret \_ i -> \case
