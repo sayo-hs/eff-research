@@ -4,7 +4,6 @@
 module Control.Monad.Effect.StaticPromptStack where
 
 import Control.Monad (ap, (>=>))
-import Control.Monad.Effect (Effect, Except (..), NonDet (..), SomeEff (..))
 import Data.Extensible (
     ExtConst (..),
     Membership (at, inject),
@@ -20,6 +19,22 @@ import Data.Extensible (
  )
 import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
+
+type Effect = (Type -> Type) -> Type -> Type
+
+data Evil :: Effect where
+    Evil :: Evil f ()
+
+data NonDet :: Effect where
+    Choose :: NonDet f Bool
+    Observe :: f [a] -> NonDet f [a]
+
+data Except e :: Effect where
+    Throw :: e -> Except e f a
+    Try :: f a -> Except e f (Either e a)
+
+data SomeEff :: Effect where
+    SomeEff :: SomeEff f Int
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
     deriving (Functor)
