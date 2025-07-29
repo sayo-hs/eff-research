@@ -4,6 +4,7 @@
 module Control.Monad.Effect.DynamicPromptStack where
 
 import Control.Monad (ap, join, (>=>))
+import Control.Monad.Effect
 import Data.Extensible (
     ExtConst (..),
     Membership (inject, project),
@@ -22,13 +23,12 @@ import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
 
-type Effect = (Type -> Type) -> Type -> Type
 type data Prompt = P (Type -> Type) [Effect]
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership e esSend -> Membership (P f es) w -> e (Eff esSend) x -> Ctl w esSend x) ->
-        Membership (P f es) ps ->
+        (forall w esSend x. Membership e esSend -> Membership (P f u) w -> e (Eff esSend) x -> Ctl w esSend x) ->
+        Membership (P f u) ps ->
         Handler ps e
 
 type Handlers ps es = Rec es (ExtConst (Handler ps)) '()
@@ -69,9 +69,9 @@ raiseUnder = trans \(Cons h (Cons _ hs)) -> Cons h hs
 swap :: Handlers ps (e1 : e2 : es) -> Handlers ps (e2 : e1 : es)
 swap (Cons h1 (Cons h2 es)) = Cons h2 (Cons h1 es)
 
-newtype Ctl (ps :: [Prompt]) (es :: [Effect]) a = Ctl {unCtl :: Handlers ps es -> EffCtlF ps es a}
+newtype Ctl (ps :: [Prompt]) (es :: [Effect]) a = Ctl {unCtl :: Handlers ps es -> CtlF ps es a}
 
-data EffCtlF ps es a
+data CtlF ps es a
     = Pure a
     | forall x. Freer (Union ps Control x) (x -> Eff es a)
 
@@ -93,7 +93,7 @@ perform :: (e :> es) => e (Eff es) a -> Eff es a
 perform = send membership
 
 control :: Membership (P f u) ps -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
-control i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
+control i f = Ctl \_ -> Freer (inject i $ Control f) pure
 
 control0 :: Membership (P f u) ps -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
 control0 i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
@@ -183,6 +183,7 @@ runSomeEff = fmap runIdentity . interpret (\_ i SomeEff -> control0 i \_ -> perf
 
 data NonDet :: Effect where
     Choose :: NonDet f Bool
+    Observe :: f [a] -> NonDet f [a]
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
 runNonDet = interpret \_ i -> \case
@@ -191,15 +192,18 @@ runNonDet = interpret \_ i -> \case
             xs <- k False
             ys <- k True
             pure $ xs ++ ys
+    Observe m -> delimit i $ unEff m
 
 -- >>> test
--- [(False,False),(False,True),(True,False),(True,True)]
+-- [Identity [(False,False),(True,False)],Identity [(False,False),(True,True)],Identity [(False,True),(True,False)],Identity [(False,True),(True,True)]]
 
-test :: [(Bool, Bool)]
+test :: [Identity [(Bool, Bool)]]
 test = runPure $ runNonDet do
-    b1 <- perform Choose
-    b2 <- perform Choose
-    pure [(b1, b2)]
+    xs <- perform $ Observe do
+        b1 <- perform Choose
+        b2 <- perform Choose
+        pure [(b1, b2)]
+    pure [Identity xs]
 
 data Reader r :: Effect where
     Ask :: Reader r f r
@@ -231,9 +235,6 @@ runReader2 r m = do
             . fmap Identity
             $ raiseUnder m
 -}
-
-data Evil :: Effect where
-    Evil :: Evil f ()
 
 runEvil :: Eff (Evil : es) a -> Eff es (Eff es a)
 runEvil = interpret (\_ i Evil -> control0 i \k -> pure $ join $ k ()) . fmap pure
