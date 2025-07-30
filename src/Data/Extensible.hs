@@ -8,8 +8,10 @@ data Union (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
     There :: Union xs h a -> Union (x : xs) h a
 
 data Rec (xs :: [k]) (h :: k -> l -> Type) (a :: l) where
-    Cons :: h x a -> Rec xs h a -> Rec (x : xs) h a
+    (:*) :: h x a -> Rec xs h a -> Rec (x : xs) h a
     Nil :: Rec '[] h a
+
+infixr 9 :*
 
 newtype ExtConst (h :: k -> Type) (x :: k) (a :: l) = ExtConst {getExtConst :: h x}
 
@@ -27,8 +29,8 @@ membership0 =
         \case
             Here x -> Just x
             _ -> Nothing
-        (\(Cons h _) -> h)
-        (\h (Cons _ hs) -> Cons h hs)
+        (\(h :* _) -> h)
+        (\h (_ :* hs) -> h :* hs)
 
 weakenMembership :: Membership xs x -> Membership (x' : xs) x
 weakenMembership i =
@@ -37,8 +39,8 @@ weakenMembership i =
         \case
             Here _ -> Nothing
             There u -> project i u
-        (\(Cons _ hs) -> at i hs)
-        (\h (Cons h' hs) -> Cons h' $ update i h hs)
+        (\(_ :* hs) -> at i hs)
+        (\h (h' :* hs) -> h' :* update i h hs)
 
 class x :> xs where
     membership :: Membership xs x
@@ -51,12 +53,12 @@ instance {-# OVERLAPPABLE #-} (x :> xs) => x :> (x' : xs) where
 
 mapRec :: (forall x. h x a -> i x b) -> Rec xs h a -> Rec xs i b
 mapRec f = \case
-    Cons x xs -> Cons (f x) (mapRec f xs)
+    x :* xs -> f x :* mapRec f xs
     Nil -> Nil
 
 zipRec :: (forall x. h x a -> i x b -> j x c) -> Rec xs h a -> Rec xs i b -> Rec xs j c
 zipRec f = \cases
-    (Cons x xs) (Cons y ys) -> Cons (f x y) (zipRec f xs ys)
+    (x :* xs) (y :* ys) -> f x y :* zipRec f xs ys
     Nil Nil -> Nil
 
 nil :: Union '[] h a -> r
@@ -71,7 +73,20 @@ instance '[] < ys where
     memberships = Nil
 
 instance (x :> ys, xs < ys) => (x : xs) < ys where
-    memberships = Cons (ExtConst membership) memberships
+    memberships = ExtConst membership :* memberships
 
 subset :: Memberships xs ys -> Rec ys h a -> Rec xs h a
 subset is ys = mapRec (\(ExtConst i) -> at i ys) is
+
+dropRec :: Rec (x : xs) h a -> Rec xs h a
+dropRec (_ :* xs) = xs
+
+infixr 9 +:
+(+:) :: (h x a -> r) -> (Union xs h a -> r) -> Union (x : xs) h a -> r
+f +: g = \case
+    Here x -> f x
+    There u -> g u
+
+infixr 9 *:
+(*:) :: (r -> h x a) -> (r -> Rec xs h a) -> r -> Rec (x : xs) h a
+(f *: g) r = f r :* g r

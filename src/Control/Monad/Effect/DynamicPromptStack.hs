@@ -6,23 +6,7 @@
 module Control.Monad.Effect.DynamicPromptStack where
 
 import Control.Monad (ap, join, (>=>))
-import Data.Extensible (
-    ExtConst (..),
-    Membership (inject, project),
-    Rec (..),
-    Union (..),
-    at,
-    mapRec,
-    membership,
-    membership0,
-    memberships,
-    nil,
-    subset,
-    update,
-    weakenMembership,
-    (:>),
-    type (<),
- )
+import Data.Extensible
 import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
@@ -43,14 +27,15 @@ data SomeEff :: Effect where
 
 type data Prompt = P (Type -> Type) [Effect] [Effect]
 
-data Handler ps e where
+data Handler ps es e where
     Handler ::
-        (forall w esSend x. Membership w (P f u d) -> Handlers w d -> e x -> Ctl w esSend x) ->
+        (forall w esSend x. Membership w (P f u d) -> Memberships d esSend -> e x -> Ctl w esSend x) ->
         Membership ps (P f u d) ->
-        Handlers ps d ->
-        Handler ps e
+        Memberships d es ->
+        Handler ps es e
 
-type Handlers ps es = Rec es (ExtConst (Handler ps)) '()
+type Handlers ps es = Rec es (ExtConst (Handler ps es)) ()
+type Handlers' ps es' es = Rec es (ExtConst (Handler ps es')) ()
 
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
 
@@ -79,27 +64,35 @@ transCtl f (Ctl m) =
         Pure x -> Pure x
         Freer u k -> Freer u $ trans f . k
 
+mapHandlers :: (forall d. Memberships d es1 -> Memberships d es2) -> Handlers' ps es1 es -> Handlers' ps es2 es
+mapHandlers f = mapRec \(ExtConst (Handler h i d)) -> ExtConst $ Handler h i $ f d
+
+effset :: (forall h. Rec es' h () -> Rec es h ()) -> (forall e. Membership es' e -> Membership es e) -> Eff es a -> Eff es' a
+effset f g = trans $ mapHandlers (mapRec $ ExtConst . g . getExtConst) . f
+
 raise :: Eff es a -> Eff (e : es) a
-raise = trans \(Cons _ hs) -> hs
+raise (Eff m) = Eff $ Ctl \hs -> case unCtl m $ undefined hs of {}
 
-raiseUnder :: Eff (e : es) a -> Eff (e : e' : es) a
-raiseUnder = trans \(Cons h (Cons _ hs)) -> Cons h hs
+{-
+raiseUnder :: Eff (e1 : es) a -> Eff (e1 : e2 : es) a
+raiseUnder = effset \(e1 :* _ :* es) -> e1 :* es
+-}
 
-swap :: Handlers ps (e1 : e2 : es) -> Handlers ps (e2 : e1 : es)
-swap (Cons h1 (Cons h2 es)) = Cons h2 (Cons h1 es)
+swapEff :: Eff (e1 : e2 : es) a -> Eff (e2 : e1 : es) a
+swapEff = effset (\(e2 :* e1 :* es) -> e1 :* e2 :* es) undefined
 
 newtype Ctl (ps :: [Prompt]) (es :: [Effect]) a = Ctl {unCtl :: Handlers ps es -> CtlF ps es a}
 
 data CtlF ps es a
     = Pure a
-    | forall x. Freer (Union ps Control x) (x -> Eff es a)
+    | forall x. Freer (Union ps ControlPrim x) (x -> Eff es a)
 
-data Control (f :: Prompt) a where
-    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u d) a
-    Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Control (P f u d) a
+data ControlPrim (p :: Prompt) a where
+    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> ControlPrim (P f u d) a
+    Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> ControlPrim (P f u d) a
 
-weakenPrompt :: Handler ps e -> Handler (p : ps) e
-weakenPrompt (Handler h i d) = Handler h (weakenMembership i) (liftPrompt d)
+weakenPrompt :: Handler ps es e -> Handler (p : ps) es e
+weakenPrompt (Handler h i d) = Handler h (weakenMembership i) d
 
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
@@ -108,11 +101,15 @@ send :: Membership es e -> e a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
     ExtConst (Handler h i' d) -> unCtl (h i' d e) hs
 
+{-
 sendWith :: Handler ps e -> e a -> Ctl ps es a
 sendWith (Handler h i d) = h i d
+-}
 
+{-
 performWith :: (e :> d) => Handlers ps d -> e a -> Ctl ps es a
 performWith d = sendWith $ getExtConst $ at membership d
+-}
 
 perform :: (e :> es) => e a -> Eff es a
 perform = send membership
@@ -142,6 +139,9 @@ delimit i (Ctl m) = Ctl \hs ->
             Just (Control ctl) -> unCtl (unEff $ ctl k) hs
             _ -> Freer ctls k
 
+data Control (p :: Prompt) :: Effect where
+    Capture :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u d) a
+
 {-
 interpretShallow ::
     (forall w esSend x. Membership (P f (e : es) d) w -> Handler w d -> e x -> Ctl w esSend x) ->
@@ -160,12 +160,12 @@ interpretShallow h (Eff m) =
 
 interpret ::
     (d < es) =>
-    (forall w esSend x. Membership w (P f es d) -> Handlers w d -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f es d) -> Memberships d esSend -> e x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = Cons (ExtConst $ Handler h membership0 (subset memberships $ liftPrompt hs)) (liftPrompt hs)
+        let hs' = mapHandlers undefined $ ExtConst (Handler h membership0 memberships) :* (liftPrompt hs)
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -178,8 +178,10 @@ runPure (Eff m) = case unCtl m Nil of
     Pure x -> x
     Freer u _ -> nil u
 
+{-
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
 runSomeEff = fmap runIdentity . interpret @'[Except String] (\_ h SomeEff -> performWith h $ Throw "") . fmap Identity
+-}
 
 {-
 runExcept :: Eff (Except e : es) a -> Eff es (Either e a)
