@@ -6,23 +6,7 @@
 module Control.Monad.Effect.DynamicPromptStack where
 
 import Control.Monad (ap, join, (>=>))
-import Data.Extensible (
-    ExtConst (..),
-    Membership (inject, project),
-    Rec (..),
-    Union (..),
-    at,
-    mapRec,
-    membership,
-    membership0,
-    memberships,
-    nil,
-    subset,
-    update,
-    weakenMembership,
-    (:>),
-    type (<),
- )
+import Data.Extensible
 import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
@@ -41,13 +25,12 @@ data Except e :: Effect where
 data SomeEff :: Effect where
     SomeEff :: SomeEff Int
 
-type data Prompt = P (Type -> Type) [Effect] [Effect]
+type data Prompt = P (Type -> Type) [Effect]
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership w (P f u d) -> Handlers w d -> e x -> Ctl w esSend x) ->
-        Membership ps (P f u d) ->
-        Handlers ps d ->
+        (forall w esSend x. Membership w (P f u) -> e x -> Ctl w esSend x) ->
+        Membership ps (P f u) ->
         Handler ps e
 
 type Handlers ps es = Rec es (ExtConst (Handler ps)) '()
@@ -95,21 +78,21 @@ data CtlF ps es a
     | forall x. Freer (Union ps ControlPrim x) (x -> Eff es a)
 
 data ControlPrim (p :: Prompt) a where
-    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> ControlPrim (P f u d) a
-    Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> ControlPrim (P f u d) a
+    Control :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> ControlPrim (P f u) a
+    Control0 :: (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> ControlPrim (P f u) a
 
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
-weakenPrompt (Handler h i d) = Handler h (weakenMembership i) (liftPrompt d)
+weakenPrompt (Handler h i) = Handler h (weakenMembership i)
 
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
 send :: Membership es e -> e a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
-    ExtConst (Handler h i' d) -> unCtl (h i' d e) hs
+    ExtConst (Handler h i') -> unCtl (h i' e) hs
 
 sendWith :: Handler ps e -> e a -> Ctl ps es a
-sendWith (Handler h i d) = h i d
+sendWith (Handler h i) = h i
 
 performWith :: (e :> d) => Handlers ps d -> e a -> Ctl ps es a
 performWith d = sendWith $ getExtConst $ at membership d
@@ -117,10 +100,10 @@ performWith d = sendWith $ getExtConst $ at membership d
 perform :: (e :> es) => e a -> Eff es a
 perform = send membership
 
-control :: Membership ps (P f u d) -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
+control :: Membership ps (P f u) -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
 control i f = Ctl \_ -> Freer (inject i $ Control f) pure
 
-control0 :: Membership ps (P f u d) -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
+control0 :: Membership ps (P f u) -> (forall x. (a -> Eff u (f x)) -> Eff u (f x)) -> Ctl ps es a
 control0 i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
 
 pureCtl :: a -> Ctl ps es a
@@ -134,7 +117,7 @@ bindCtl (Ctl m) f = Ctl \hs -> case m hs of
 fmapCtl :: (a -> b) -> Ctl ps es a -> Ctl ps es b
 fmapCtl f m = m `bindCtl` (pure . f)
 
-delimit :: Membership ps (P f u d) -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit :: Membership ps (P f u) -> Ctl ps es (f a) -> Ctl ps es (f a)
 delimit i (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
@@ -143,7 +126,7 @@ delimit i (Ctl m) = Ctl \hs ->
             _ -> Freer ctls k
 
 data Control (p :: Prompt) :: Effect where
-    Capture :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u d) a
+    Capture :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u) a
 
 {-
 interpretShallow ::
@@ -162,13 +145,12 @@ interpretShallow h (Eff m) =
 -}
 
 interpret ::
-    (d < es) =>
-    (forall w esSend x. Membership w (P f es d) -> Handlers w d -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f es) -> e x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = ExtConst (Handler h membership0 (subset memberships $ liftPrompt hs)) :* liftPrompt hs
+        let hs' = ExtConst (Handler h membership0) :* liftPrompt hs
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
@@ -184,9 +166,9 @@ runPure (Eff m) = case unCtl m Nil of
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
 runSomeEff =
     fmap runIdentity
-        . interpret @'[Except String]
-            ( \_ h SomeEff -> do
-                performWith h $ Throw ""
+        . interpret
+            ( \i SomeEff -> do
+                control0 i \_ -> perform $ Throw ""
             )
         . fmap Identity
 
