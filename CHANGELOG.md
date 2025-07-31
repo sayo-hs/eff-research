@@ -1,4 +1,4 @@
-# Revision history for kontrolle
+# Revision history for safe-eff
 
 ## 0.1.0.0 -- YYYY-mm-dd
 
