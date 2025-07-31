@@ -11,25 +11,25 @@ import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Kind (Type)
 
-type Effect = Type -> Type
+type Effect = (Type -> Type) -> Type -> Type
 
 data Evil :: Effect where
-    Evil :: Evil ()
+    Evil :: Evil f ()
 
 data NonDet :: Effect where
-    Choose :: NonDet Bool
+    Choose :: NonDet f Bool
 
 data Except e :: Effect where
-    Throw :: e -> Except e a
+    Throw :: e -> Except e f a
 
 data SomeEff :: Effect where
-    SomeEff :: SomeEff Int
+    SomeEff :: SomeEff f Int
 
 type data Prompt = P (Type -> Type) [Effect]
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership w (P f u) -> e x -> Ctl w esSend x) ->
+        (forall w esSend x. Membership w (P f u) -> e (Eff esSend) x -> Ctl w esSend x) ->
         Membership ps (P f u) ->
         Handler ps e
 
@@ -87,17 +87,17 @@ weakenPrompt (Handler h i) = Handler h (weakenMembership i)
 liftPrompt :: forall p ps es. Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
-send :: Membership es e -> e a -> Eff es a
+send :: Membership es e -> e (Eff es) a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
     ExtConst (Handler h i') -> unCtl (h i' e) hs
 
-sendWith :: Handler ps e -> e a -> Ctl ps es a
+sendWith :: Handler ps e -> e (Eff es) a -> Ctl ps es a
 sendWith (Handler h i) = h i
 
-performWith :: (e :> d) => Handlers ps d -> e a -> Ctl ps es a
+performWith :: (e :> d) => Handlers ps d -> e (Eff es) a -> Ctl ps es a
 performWith d = sendWith $ getExtConst $ at membership d
 
-perform :: (e :> es) => e a -> Eff es a
+perform :: (e :> es) => e (Eff es) a -> Eff es a
 perform = send membership
 
 control :: Membership ps (P f u) -> (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Ctl ps esSend a
@@ -125,27 +125,38 @@ delimit i (Ctl m) = Ctl \hs ->
             Just (Control ctl) -> unCtl (unEff $ ctl k) hs
             _ -> Freer ctls k
 
-data Control (p :: Prompt) :: Effect where
-    Capture :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control (P f u) a
+data Control (f :: Type -> Type) :: Effect where
+    Capture :: (forall es x. (a -> Eff es (f x)) -> Eff es (f x)) -> Control f m a
+    Delimit :: m (f a) -> Control f m (f a)
 
-{-
+runControl :: Eff (Control f : es) (f a) -> Eff es (f a)
+runControl = interpretShallow \i -> \case
+    Capture f -> control i f
+    Delimit (Eff m) -> delimit i m
+
+data Control0 (f :: Type -> Type) es :: Effect where
+    Capture0 :: (forall x. (a -> Eff (Control0 f es : es) (f x)) -> Eff (Control0 f es : es) (f x)) -> Control0 f es m a
+
+runControl0 :: Eff (Control0 f es : es) (f a) -> Eff es (f a)
+runControl0 = interpretShallow \i -> \case
+    Capture0 f -> control0 i f
+
 interpretShallow ::
-    (forall w esSend x. Membership (P f (e : es) d) w -> Handler w d -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f (e : es)) -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpretShallow h (Eff m) =
     Eff $ Ctl \hs ->
-        let hs' = Cons (ExtConst $ Handler h membership0 undefined) (liftPrompt hs)
+        let hs' = ExtConst (Handler h membership0) :* liftPrompt hs
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
                     Here (Control ctl) -> unCtl (unEff $ interpretShallow h $ ctl k) hs
                     Here (Control0 ctl) -> unCtl (unEff $ interpretShallow h $ ctl k) hs
                     There u -> Freer u $ interpretShallow h . k
--}
 
 interpret ::
-    (forall w esSend x. Membership w (P f es) -> e x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f es) -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
@@ -154,7 +165,7 @@ interpret h (Eff m) =
          in case unCtl m hs' of
                 Pure x -> Pure x
                 Freer ctls k -> case ctls of
-                    Here (Control ctl) -> unCtl (unEff $ ctl $ interpret h . k) hs
+                    Here (Control ctl) -> unCtl (unEff $ interpret h $ ctl k) hs
                     Here (Control0 ctl) -> unCtl (unEff $ ctl $ interpret h . k) hs
                     There u -> Freer u $ interpret h . k
 
