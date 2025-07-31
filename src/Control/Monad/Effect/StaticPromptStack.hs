@@ -31,7 +31,7 @@ data SomeEff :: Effect where
 newtype Eff es a = Eff {unEff :: forall ps. Ctl ps es a}
     deriving (Functor)
 
-type data Prompt = P (Type -> Type) [Prompt] Effect
+type data Prompt = P (Type -> Type) [Prompt] Effect [Effect]
 
 newtype Ctl (ps :: [Prompt]) (es :: [Effect]) a = Ctl {unCtl :: Handlers ps es -> CtlF ps es a}
 
@@ -39,8 +39,9 @@ type Handlers ps es = Rec es (ExtConst (Handler ps)) ()
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership w (P f u e) -> e (Eff esSend) x -> Ctl w esSend x) ->
-        Membership ps (P f u e) ->
+        (forall w esSend x. Membership w (P f u e d) -> Handlers w d -> e (Eff esSend) x -> Ctl w esSend x) ->
+        Membership ps (P f u e d) ->
+        Handlers ps d ->
         Handler ps e
 
 data CtlF ps es a
@@ -48,8 +49,7 @@ data CtlF ps es a
     | forall x. Freer (Union ps ControlPrim x) (x -> Ctl ps es a)
 
 data ControlPrim (p :: Prompt) a where
-    Control :: (forall ps es x. Membership ps (P f u e) -> (a -> Ctl ps es (f x)) -> Ctl ps es (f x)) -> ControlPrim (P f u e) a
-    Control0 :: (forall es x. (a -> Ctl (P f u e : u) es (f x)) -> Ctl (P f u e : u) es (f x)) -> ControlPrim (P f u e) a
+    Control :: (forall ps es x. Membership ps (P f u e d) -> (a -> Ctl ps es (f x)) -> Ctl ps es (f x)) -> ControlPrim (P f u e d) a
 
 instance Functor (Ctl ps es) where
     fmap f = (>>= pure . f)
@@ -80,53 +80,48 @@ raisesEnv = undefined
 
 send :: Membership es e -> e (Eff es) a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
-    ExtConst (Handler h i') -> unCtl (h i' e) hs
+    ExtConst (Handler h i' d) -> unCtl (h i' d e) hs
 
 sendWith :: Handlers ps es -> Membership es e -> e (Eff es') a -> Ctl ps es' a
 sendWith hs ie e = case at ie hs of
-    ExtConst (Handler h i') -> h i' e
+    ExtConst (Handler h i' d) -> h i' d e
 
 perform :: (e :> es) => e (Eff es) a -> Eff es a
 perform = send membership
 
 control ::
-    Membership ps (P f u e) ->
-    (forall ps' es' x. Membership ps' (P f u e) -> (a -> Ctl ps' es' (f x)) -> Ctl ps' es' (f x)) ->
+    Membership ps (P f u e d) ->
+    (forall ps' es' x. Membership ps' (P f u e d) -> (a -> Ctl ps' es' (f x)) -> Ctl ps' es' (f x)) ->
     Ctl ps es a
 control i f = Ctl \_ -> Freer (inject i $ Control f) pure
 
-control0 ::
-    Membership ps (P f u e) ->
-    (forall es' x. (a -> Ctl (P f u e : u) es' (f x)) -> Ctl (P f u e : u) es' (f x)) ->
-    Ctl ps es a
-control0 i f = Ctl \_ -> Freer (inject i $ Control0 f) pure
-
 weakenPrompt :: Handler ps e -> Handler (p : ps) e
-weakenPrompt (Handler h i) = Handler h (weakenMembership i)
+weakenPrompt (Handler h i d) = Handler h (weakenMembership i) (liftPrompt d)
 
 liftPrompt :: Handlers ps es -> Handlers (p : ps) es
 liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
 interpretCtl ::
-    (forall w esSend x. Membership w (P f ps e) -> e (Eff esSend) x -> Ctl w esSend x) ->
-    Ctl (P f ps e : ps) (e : es) (f a) ->
+    (d < es) =>
+    (forall w esSend x. Membership w (P f ps e d) -> Handlers w d -> e (Eff esSend) x -> Ctl w esSend x) ->
+    Ctl (P f ps e d : ps) (e : es) (f a) ->
     Ctl ps es (f a)
 interpretCtl h m = Ctl \hs ->
-    let hs' = ExtConst (Handler h membership0) :* liftPrompt hs
+    let hs' = ExtConst (Handler h membership0 $ subset memberships $ liftPrompt hs) :* liftPrompt hs
      in case unCtl m hs' of
             Pure x -> Pure x
             Freer ctls k -> case ctls of
                 Here (Control ctl) -> unCtl (interpretCtl h $ ctl membership0 k) hs
-                Here (Control0 ctl) -> unCtl (interpretCtl h $ ctl k) hs
                 There u -> Freer u $ interpretCtl h . k
 
 interpret ::
-    (forall w ps esSend x. Membership w (P f ps e) -> Handlers ps es -> e (Eff esSend) x -> Ctl w esSend x) ->
+    (d < es) =>
+    (forall w ps esSend x. Membership w (P f ps e d) -> Handlers w d -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
-interpret h (Eff m) = Eff $ Ctl \hs -> unCtl (interpretCtl (\ih -> h ih hs) m) hs
+interpret h (Eff m) = Eff $ interpretCtl h m
 
-delimit :: Membership ps (P f u e) -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit :: Membership ps (P f u e d) -> Ctl ps es (f a) -> Ctl ps es (f a)
 delimit i (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
@@ -141,7 +136,7 @@ runPure (Eff (Ctl m)) = case m Nil of
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
 runNonDet =
-    interpret \i _ -> \case
+    interpret @'[] \i _ -> \case
         Choose -> control i \i' k -> do
             xs <- delimit i' $ k False
             ys <- delimit i' $ k True
@@ -160,12 +155,12 @@ test = runPure $ runNonDet do
     pure [Identity xs]
 
 runExcept :: Eff (Except e : es) (Either e a) -> Eff es (Either e a)
-runExcept = interpret \i _ -> \case
+runExcept = interpret @'[] \i _ -> \case
     Throw e -> control i \_ _ -> pure $ Left e
     Try m -> delimit i $ Right <$> unEff m
 
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
-runSomeEff = fmap runIdentity . interpret (\i hs SomeEff -> control0 i (=<< sendWith (liftPrompt hs) membership (Throw "uncaught"))) . fmap Identity
+runSomeEff = fmap runIdentity . interpret @'[Except String] (\_ hs SomeEff -> sendWith hs membership $ Throw "uncaught") . fmap Identity
 
 catch :: (Except e :> es) => Eff es a -> (e -> Eff es a) -> Eff es a
 catch m hdl =
@@ -174,7 +169,7 @@ catch m hdl =
         Right x -> pure x
 
 -- >>> testE
--- Left "uncaught"
+-- Right 8
 
 testE :: Either String Int
 testE = runPure $ runExcept $ runSomeEff do
