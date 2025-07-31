@@ -1,11 +1,10 @@
-{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE TypeData #-}
 
 -- SPDX-License-Identifier: MPL-2.0
 
 module Control.Monad.Effect.DynamicPromptStack where
 
-import Control.Monad (ap, (>=>))
+import Control.Monad (ap, join, (>=>))
 import Data.Extensible
 import Data.Function ((&))
 import Data.Functor.Identity (Identity (Identity), runIdentity)
@@ -31,7 +30,7 @@ type data Prompt = P (Type -> Type) [Effect] Effect
 
 data Handler ps e where
     Handler ::
-        (forall w esSend x. Membership esSend e -> Membership w (P f u e) -> e (Eff esSend) x -> Ctl w esSend x) ->
+        (forall w esSend x. Membership w (P f u e) -> Membership esSend e -> e (Eff esSend) x -> Ctl w esSend x) ->
         Membership ps (P f u e) ->
         Handler ps e
 
@@ -91,15 +90,7 @@ liftPrompt = mapRec $ ExtConst . weakenPrompt . getExtConst
 
 send :: Membership es e -> e (Eff es) a -> Eff es a
 send i e = Eff $ Ctl \hs -> case at i hs of
-    ExtConst (Handler h i') -> unCtl (h i i' e) hs
-
-{-
-sendWith :: Handler ps e -> e (Eff es) a -> Ctl ps es a
-sendWith (Handler h i) = h i
-
-performWith :: (e :> d) => Handlers ps d -> e (Eff es) a -> Ctl ps es a
-performWith d = sendWith $ getExtConst $ at membership d
--}
+    ExtConst (Handler h i') -> unCtl (h i' i e) hs
 
 perform :: (e :> es) => e (Eff es) a -> Eff es a
 perform = send membership
@@ -121,8 +112,8 @@ bindCtl (Ctl m) f = Ctl \hs -> case m hs of
 fmapCtl :: (a -> b) -> Ctl ps es a -> Ctl ps es b
 fmapCtl f m = m `bindCtl` (pure . f)
 
-delimit :: Membership es e -> Membership ps (P f u e) -> Ctl ps es (f a) -> Ctl ps es (f a)
-delimit ie i (Ctl m) = Ctl \hs ->
+delimit :: Membership ps (P f u e) -> Membership es e -> Ctl ps es (f a) -> Ctl ps es (f a)
+delimit i ie (Ctl m) = Ctl \hs ->
     case m hs of
         Pure x -> Pure x
         Freer ctls k -> case project i ctls of
@@ -134,19 +125,19 @@ data Control (f :: Type -> Type) :: Effect where
     Delimit :: m (f a) -> Control f m (f a)
 
 runControl :: Eff (Control f : es) (f a) -> Eff es (f a)
-runControl = interpretShallow \ie i -> \case
+runControl = interpretShallow \i ie -> \case
     Capture f -> control i f
-    Delimit (Eff m) -> delimit ie i m
+    Delimit (Eff m) -> delimit i ie m
 
 data Control0 (f :: Type -> Type) es :: Effect where
     Capture0 :: (forall x. (a -> Eff (Control0 f es : es) (f x)) -> Eff (Control0 f es : es) (f x)) -> Control0 f es m a
 
 runControl0 :: Eff (Control0 f es : es) (f a) -> Eff es (f a)
-runControl0 = interpretShallow \_ i -> \case
+runControl0 = interpretShallow \i _ -> \case
     Capture0 f -> control0 i f
 
 interpretShallow ::
-    (forall w esSend x. Membership esSend e -> Membership w (P f (e : es) e) -> e (Eff esSend) x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f (e : es) e) -> Membership esSend e -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpretShallow h (Eff m) =
@@ -160,7 +151,7 @@ interpretShallow h (Eff m) =
                     There u -> Freer u $ interpretShallow h . k
 
 interpret ::
-    (forall w esSend x. Membership esSend e -> Membership w (P f es e) -> e (Eff esSend) x -> Ctl w esSend x) ->
+    (forall w esSend x. Membership w (P f es e) -> Membership esSend e -> e (Eff esSend) x -> Ctl w esSend x) ->
     Eff (e : es) (f a) ->
     Eff es (f a)
 interpret h (Eff m) =
@@ -181,14 +172,14 @@ runPure (Eff m) = case unCtl m Nil of
 runSomeEff :: (Except String :> es) => Eff (SomeEff : es) a -> Eff es a
 runSomeEff =
     fmap runIdentity
-        . interpret (\_ i SomeEff -> control0 i \_ -> perform $ Throw "uncaught")
+        . interpret (\i _ SomeEff -> control0 i \_ -> perform $ Throw "uncaught")
         . fmap Identity
 
 runExcept :: Eff (Except e : es) a -> Eff es (Either e a)
 runExcept m =
-    Right <$> m & interpret \ie i -> \case
+    Right <$> m & interpret \i ie -> \case
         Throw e -> control i \_ _ -> pure $ Left e
-        Try n -> delimit ie i $ unEff $ Right <$> n
+        Try n -> delimit i ie $ unEff $ Right <$> n
 
 -- >>> testE
 -- Left "uncaught"
@@ -199,12 +190,12 @@ testE = runPure $ runExcept $ runSomeEff do
 
 runNonDet :: Eff (NonDet : es) [a] -> Eff es [a]
 runNonDet =
-    interpret \ie i -> \case
+    interpret \i ie -> \case
         Choose -> control i \ie' k -> do
             xs <- send ie' $ Observe $ k False
             ys <- send ie' $ Observe $ k True
             pure $ xs ++ ys
-        Observe n -> delimit ie i $ unEff n
+        Observe n -> delimit i ie $ unEff n
 
 -- >>> test
 -- [Identity [(False,False),(False,True),(True,False),(True,True)]]
@@ -217,9 +208,8 @@ test = runPure $ runNonDet do
         pure [(b1, b2)]
     pure [Identity xs]
 
-{-
 data Reader r :: Effect where
-    Ask :: Reader r r
+    Ask :: Reader r f r
 
 -- Local :: (r -> r) -> f a -> Reader r f a
 
@@ -232,22 +222,6 @@ runReader r =
                 -- Local f m -> unEff $ runReader (f r) (pull i m)
             )
         . fmap Identity
-
-{-
-runReader2 :: r -> Eff (Reader r : es) a -> Eff es a
-runReader2 r m = do
-    runReader @Int 10 do
-        fmap runIdentity
-            . interpret
-                ( \i ip -> \case
-                    Ask -> pureCtl r
-                    Local f m' -> do
-                        (control ip \k -> undefined)
-                            `bindCtl` (\_ -> runReader (f r) (pull i m'))
-                )
-            . fmap Identity
-            $ raiseUnder m
--}
 
 runEvil :: Eff (Evil : es) a -> Eff es (Eff es a)
 runEvil = interpret (\i _ Evil -> control0 i \k -> pure $ join $ k ()) . fmap pure
@@ -266,5 +240,3 @@ testNSR = runPure do
     k <- runReader @Int 1 $ runEvil prog
 
     runReader @Int 2 k
-
--}

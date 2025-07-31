@@ -1,13 +1,10 @@
 {-# LANGUAGE TypeData #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
-{-# HLINT ignore "Avoid lambda using `infix`" #-}
+-- SPDX-License-Identifier: MPL-2.0
 
 module Control.Monad.Effect.StaticPromptStack where
 
-import Control.Monad (ap, join, (>=>))
-import Control.Monad.Effect.DynamicPromptStack qualified as D
+import Control.Monad (ap, (>=>))
 import Data.Extensible
 import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
