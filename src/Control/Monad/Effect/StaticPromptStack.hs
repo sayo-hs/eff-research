@@ -6,6 +6,8 @@ module Control.Monad.Effect.StaticPromptStack where
 
 import Control.Monad (ap, (>=>))
 import Data.Extensible
+import Data.Function (fix)
+import Data.Functor.Const (Const (Const), getConst)
 import Data.Functor.Identity (Identity (Identity), runIdentity)
 import Data.Kind (Type)
 import Data.List (singleton)
@@ -189,16 +191,14 @@ test = runPure $ runNonDet do
         pure (x, y)
     pure [Identity xs]
 
-{-
 runState :: s -> Eff (State s : es) a -> Eff es a
 runState s0 =
     fmap runIdentity
-        . ( handleShallow \case
-                Get -> \k -> k s0
-                Put s -> \k -> undefined
+        . ( interpret @'[] \i _ _ -> \case
+                Get -> pure s0
+                Put s -> undefined
           )
         . fmap Identity
--}
 
 runExcept :: Eff (Except e : es) (Either e a) -> Eff es (Either e a)
 runExcept = interpret @'[] \i _ _ -> \case
@@ -223,6 +223,44 @@ catch m hdl =
     perform (Try m) >>= \case
         Left e -> hdl e
         Right x -> pure x
+
+data Cont (f :: Type -> Type) (g :: Type -> Type) :: Effect where
+    Shift :: (forall ps es x. (a -> Ctl ps es (g x)) -> Ctl ps es (g x)) -> Cont f g m a
+    Reset :: m (f a) -> Cont f g m (g a)
+
+runCont :: (forall x. f x -> g x) -> Eff (Cont f g : es) (f a) -> Eff es (g a)
+runCont ret =
+    interpret @'[]
+        ( \i _ _ -> \case
+            Shift f -> shift i \_ k -> f k
+            Reset m -> delimit i (unEff $ fmap ret m)
+        )
+        . fmap ret
+
+data Cont0 r (ps :: [Prompt]) (es :: [Effect]) :: Effect where
+    Shift0 ::
+        ( (a -> Ctl (P (Const r) ps (Cont0 r ps es : es) (Cont0 r ps es) '[] : ps) (Cont0 r ps es : es) r) ->
+          Ctl (P (Const r) ps (Cont0 r ps es : es) (Cont0 r ps es) '[] : ps) (Cont0 r ps es : es) r
+        ) ->
+        Cont0 r ps es m a
+    Run0 :: Ctl (P (Const r) ps (Cont0 r ps es : es) (Cont0 r ps es) '[] : ps) (Cont0 r ps es : es) a -> Cont0 r ps es m a
+
+runCont0 :: Ctl (P (Const r) ps (Cont0 r ps es : es) (Cont0 r ps es) '[] : ps) (Cont0 r ps es : es) r -> Ctl ps es r
+runCont0 =
+    fmap getConst
+        . ( interpretCtl @'[] \i _ _ -> \case
+                Shift0 f -> control0 i \k -> fmap Const $ f $ fmap getConst . k
+                Run0 m -> control0 i (m >>=)
+          )
+        . fmap Const
+
+runCont0' :: (forall ps. Eff (Cont0 r ps es : es) r) -> Eff es r
+runCont0' m = Eff $ runCont0 $ unEff m
+
+contTest :: String
+contTest = runPure $ fmap getConst $ runCont0' $ do
+    x <- send membership0 $ Shift0 \k -> let k' = k k' in k'
+    send membership0 $ Run0 x
 
 -- >>> testE
 -- Right 8
