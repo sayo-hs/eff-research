@@ -1,2 +1,2 @@
-# safe-eff
-Experimental, type-safe algebraic effects
+# eff-research
+A playground for exploring algebraic effect techniques.

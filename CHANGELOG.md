@@ -1,4 +1,4 @@
-# Revision history for safe-eff
+# Revision history for eff-research
 
 ## 0.1.0.0 -- YYYY-mm-dd
 
